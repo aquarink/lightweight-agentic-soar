@@ -1,0 +1,11 @@
+# Ignore dynamic database
+soar_events.json
+
+# Ignore logs
+*.log
+
+# Ignore IDE and cache files
+.idea/
+.vscode/
+__pycache__/
+*.pyc
