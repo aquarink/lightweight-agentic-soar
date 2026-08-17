@@ -1,0 +1,32 @@
+type: "workflow"
+id: "00000000-0000-0000-0000-000000000001"
+alias: "wazuh-cognitive-response"
+webhook:
+  status: "online"
+definition:
+  title: "Wazuh Automated Cognitive Response"
+  description: "Menerima log dari Wazuh, melakukan analisis siber menggunakan Llama 3.2 lokal, dan memicu pemblokiran IP penyerang."
+  entrypoint:
+    ref: "llama_triage"
+  actions:
+    - id: "20000000-0000-0000-0000-000000000001"
+      ref: "llama_triage"
+      action: "ai.agent"
+      args:
+        user_prompt: "Analyze the following security log and determine if we should block the source IP. Return a JSON object with: action (block/ignore), ip (source IP), incident_type (type of incident), and analysis_summary (short summary in Indonesian). Log: ${{ TRIGGER.body }}"
+        model: "llama3.2"
+        model_name: "llama3.2"
+        model_provider: "openai"
+        enable_thinking: false
+    - id: "20000000-0000-0000-0000-000000000002"
+      ref: "active_mitigation"
+      action: "core.http_request"
+      args:
+        url: "http://10.88.0.3:8080/webhook"
+        method: "POST"
+        payload:
+          ip: "${{ ACTIONS.llama_triage.result.ip }}"
+          incident_type: "${{ ACTIONS.llama_triage.result.incident_type }}"
+          analysis_summary: "${{ ACTIONS.llama_triage.result.analysis_summary }}"
+          action: "${{ ACTIONS.llama_triage.result.action }}"
+      run_if: "${{ ACTIONS.llama_triage.result.action == 'block' }}"
