@@ -29,7 +29,7 @@ graph TD
     Agent -->|Kirim Log Enkripsi| WazuhServer[Wazuh Manager Server]
     WazuhServer -->|Integrasi Custom Webhook| SOAR[Lightweight SOAR Webhook]
     
-    subgraph SOAR Engine (Port 8080)
+    subgraph "SOAR Engine (Port 8080)"
         SOAR -->|1. Mitigasi Instan <15ms| FW[iptables Firewall Block]
         SOAR -->|2. Respon Sukses Instan| WazuhServer
         SOAR -->|3. Jalankan Thread Asinkron| Background[Background LLM Worker]
