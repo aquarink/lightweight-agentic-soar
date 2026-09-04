@@ -38,6 +38,18 @@ def save_events(events):
             print("Gagal menyimpan event ke file:", e)
 
 class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
+
+    def do_HEAD(self):
+        if self.path in ['/favicon.ico', '/favicon.png', '/soar_logo.jpg']:
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Cache-Control', 'public, max-age=86400')
+            self.end_headers()
+        else:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+
     
     # 1. HANDLE WEB DASHBOARD (GET /)
     def do_GET(self):
@@ -49,6 +61,21 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             events = load_events()
             self.wfile.write(json.dumps(events).encode('utf-8'))
             return
+
+        elif self.path in ['/favicon.ico', '/favicon.png', '/soar_logo.jpg']:
+            logo_path = '/root/riset/soar_logo.jpg'
+            if os.path.exists(logo_path):
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Cache-Control', 'public, max-age=86400')
+                self.end_headers()
+                with open(logo_path, 'rb') as img_f:
+                    self.wfile.write(img_f.read())
+                return
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
             
         elif self.path == '/' or self.path == '/index.html':
             self.send_response(200)
@@ -62,6 +89,8 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Lightweight Cognitive SOAR - Dashboard</title>
+    <link rel="icon" type="image/jpeg" href="/soar_logo.jpg">
+    <link rel="shortcut icon" href="/favicon.ico">
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-900 text-gray-100 font-sans min-h-screen">
@@ -71,7 +100,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
         <div class="flex flex-col md:flex-row md:items-center justify-between border-b border-gray-800 pb-6 mb-8">
             <div>
                 <h1 class="text-3xl font-extrabold tracking-tight text-white flex items-center">
-                    <span class="bg-indigo-600 text-white p-2 rounded-lg mr-3 shadow-lg shadow-indigo-500/30">🤖</span>
+                    <img src="/soar_logo.jpg" alt="UIN SOAR Logo" class="w-11 h-11 rounded-xl mr-3 shadow-lg shadow-cyan-500/25 object-cover border border-cyan-500/30">
                     Lightweight Agentic SOAR
                 </h1>
                 <p class="text-gray-400 mt-2 text-sm md:text-base">Sistem Orkestrasi Keamanan Siber Terintegrasi berbasis LLM Lokal Ringan (Ollama)</p>
