@@ -10,3 +10,7 @@ soar_sessions.json
 .vscode/
 __pycache__/
 *.pyc
+
+# Ignore environment & secret configs
+.env
+*.env
