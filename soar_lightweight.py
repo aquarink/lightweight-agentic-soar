@@ -490,18 +490,30 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 mitigation_status = "Diabaikan (Normal)"
                 is_valid_ip = re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip)
                 
+                # Cek whitelist agar IP infrastruktur internal tidak terblokir sendiri
+                is_whitelisted = (
+                    attacker_ip.startswith("10.88.0.") or 
+                    attacker_ip.startswith("127.") or 
+                    attacker_ip.startswith("172.20.") or
+                    attacker_ip == "38.47.180.2"
+                )
+
                 if attacker_ip and is_valid_ip:
-                    action = "block"
-                    try:
-                        res = subprocess.run(["/usr/sbin/iptables", "-C", "INPUT", "-s", attacker_ip, "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        if res.returncode == 0:
-                            mitigation_status = f"IP {attacker_ip} Sudah Diblokir Sebelumnya"
-                        else:
-                            subprocess.run(["/usr/sbin/iptables", "-A", "INPUT", "-s", attacker_ip, "-j", "DROP"], check=True)
-                            mitigation_status = f"IP {attacker_ip} Berhasil Diblokir via iptables"
-                    except Exception as err:
-                        print("Gagal eksekusi mitigasi iptables:", err)
-                        mitigation_status = f"Gagal memblokir IP {attacker_ip}"
+                    if is_whitelisted:
+                        action = "ignore"
+                        mitigation_status = f"IP {attacker_ip} Dikecualikan (Internal Whitelist)"
+                    else:
+                        action = "block"
+                        try:
+                            res = subprocess.run(["/usr/sbin/iptables", "-C", "INPUT", "-s", attacker_ip, "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            if res.returncode == 0:
+                                mitigation_status = f"IP {attacker_ip} Sudah Diblokir Sebelumnya"
+                            else:
+                                subprocess.run(["/usr/sbin/iptables", "-A", "INPUT", "-s", attacker_ip, "-j", "DROP"], check=True)
+                                mitigation_status = f"IP {attacker_ip} Berhasil Diblokir via iptables"
+                        except Exception as err:
+                            print("Gagal eksekusi mitigasi iptables:", err)
+                            mitigation_status = f"Gagal memblokir IP {attacker_ip}"
 
                 # Generate event ID unik
                 event_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
