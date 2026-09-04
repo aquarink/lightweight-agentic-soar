@@ -1,0 +1,110 @@
+[
+  {
+    "id": "100",
+    "hostname": "llm",
+    "name": "VM (100) - AI / LLM Node",
+    "wg_ip": "10.88.0.4",
+    "lan_ip": "172.20.32.81",
+    "services": "Ollama Llama 3.2 (Port 11434), chat.uinjakarta.id",
+    "status": "protected"
+  },
+  {
+    "id": "101",
+    "hostname": "minio",
+    "name": "VM (101) - MinIO Object Storage",
+    "wg_ip": "10.88.0.11",
+    "lan_ip": "172.20.32.63",
+    "services": "S3 Storage API (Port 9000), Console (Port 9001)",
+    "status": "protected"
+  },
+  {
+    "id": "102",
+    "hostname": "layanan",
+    "name": "VM (102) - Sistem Layanan UIN",
+    "wg_ip": "10.88.0.5",
+    "lan_ip": "172.20.32.23",
+    "services": "Nginx Web, PHP Laravel, layanan.uinjakarta.id",
+    "status": "protected"
+  },
+  {
+    "id": "103",
+    "hostname": "obe",
+    "name": "VM (103) - Sistem OBE",
+    "wg_ip": "10.88.0.6",
+    "lan_ip": "172.20.32.86",
+    "services": "layanan-obe.uinjakarta.id, devel-layanan-obe.uinjakarta.id",
+    "status": "protected"
+  },
+  {
+    "id": "104",
+    "hostname": "db",
+    "name": "VM (104) - Central Database & Cache",
+    "wg_ip": "10.88.0.7",
+    "lan_ip": "172.20.32.191",
+    "services": "PostgreSQL (5432), MySQL (3306), Redis (6379), MongoDB (27017)",
+    "status": "protected"
+  },
+  {
+    "id": "105",
+    "hostname": "wazuh-grafana",
+    "name": "VM (105) - SIEM Wazuh & Grafana",
+    "wg_ip": "10.88.0.12",
+    "lan_ip": "172.20.32.25",
+    "services": "Wazuh Manager (1514), Indexer (9200), Dashboard (443), Grafana (3000)",
+    "status": "protected"
+  },
+  {
+    "id": "106",
+    "hostname": "adm",
+    "name": "VM (106) - Server Administrasi (ADM)",
+    "wg_ip": "10.88.0.13",
+    "lan_ip": "172.20.32.95",
+    "services": "Aplikasi Administrasi Kampus",
+    "status": "protected"
+  },
+  {
+    "id": "107",
+    "hostname": "dev1",
+    "name": "VM (107) - Development Node (Dev1)",
+    "wg_ip": "10.88.0.15",
+    "lan_ip": "172.20.32.91",
+    "services": "Staging & Testing Environment",
+    "status": "protected"
+  },
+  {
+    "id": "108",
+    "hostname": "wa",
+    "name": "VM (108) - WhatsApp Gateway",
+    "wg_ip": "10.88.0.14",
+    "lan_ip": "172.20.32.121",
+    "services": "WhatsApp Notification API Gateway",
+    "status": "protected"
+  },
+  {
+    "id": "110",
+    "hostname": "pw",
+    "name": "VM (110) - PW Service Node",
+    "wg_ip": "10.88.0.16",
+    "lan_ip": "172.20.32.89",
+    "services": "Admin Portal (21500), Service Daemon (29005)",
+    "status": "protected"
+  },
+  {
+    "id": "host",
+    "hostname": "proxmox",
+    "name": "Hypervisor Host (Proxmox VE)",
+    "wg_ip": "10.88.0.3",
+    "lan_ip": "172.20.32.70",
+    "services": "PVE Manager (Port 8006), SOAR Engine (soar.uinjakarta.id:8080)",
+    "status": "protected"
+  },
+  {
+    "id": "vps",
+    "hostname": "vps-gateway",
+    "name": "ArusBalik Gateway & Reverse Proxy",
+    "wg_ip": "10.88.0.1",
+    "lan_ip": "38.47.180.2",
+    "services": "WireGuard Hub (Port 51820), Nginx SSL Gateway Publik",
+    "status": "protected"
+  }
+]
