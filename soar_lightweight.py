@@ -11,15 +11,34 @@ import threading
 import secrets
 from http import cookies
 
-PORT = 8080
-EVENTS_FILE = '/root/riset/soar_events.json'
-ASSETS_FILE = '/root/riset/protected_assets.json'
-SESSIONS_FILE = '/root/riset/soar_sessions.json'
-OLLAMA_URL = 'http://10.88.0.4:11434/api/generate'
-DEFAULT_TTL = 86400  # 24 Jam (dalam detik)
+def _load_env_file():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        k, v = line.split('=', 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k not in os.environ:
+                            os.environ[k] = v
+        except Exception as e:
+            print("Warning: failed to read .env file:", e)
 
-ADMIN_USER = 'admin'
-ADMIN_PASS = 'M@ngapsjunk9290'
+_load_env_file()
+
+PORT = int(os.getenv('SOAR_PORT', 8080))
+EVENTS_FILE = os.getenv('SOAR_EVENTS_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'soar_events.json'))
+ASSETS_FILE = os.getenv('SOAR_ASSETS_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'protected_assets.json'))
+SESSIONS_FILE = os.getenv('SOAR_SESSIONS_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'soar_sessions.json'))
+OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434/api/generate')
+DEFAULT_TTL = int(os.getenv('DEFAULT_TTL', 86400))
+
+ADMIN_USER = os.getenv('SOAR_ADMIN_USER', 'admin')
+ADMIN_PASS = os.getenv('SOAR_ADMIN_PASS', 'admin123')
+EXTRA_WHITELIST_IPS = set(ip.strip() for ip in os.getenv('SOAR_WHITELISTED_IPS', '').split(',') if ip.strip())
 
 db_lock = threading.Lock()
 
@@ -585,7 +604,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                         <h2 class="text-lg font-semibold text-white flex items-center">
                             <span>🚫 Daftar IP Terblokir Aktif (Edge + Host Kernel Hash)</span>
                         </h2>
-                        <p class="text-xs text-red-400 mt-0.5">Semua IP di bawah ini di-DROP secara O(1) di Edge Gateway ArusBalik (38.47.180.2) dan Proxmox Host</p>
+                        <p class="text-xs text-red-400 mt-0.5">Semua IP di bawah ini di-DROP secara O(1) di Edge Gateway ArusBalik dan Proxmox Host</p>
                     </div>
                     <div>
                         <button onclick="fetchBlockedFromDB()" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-xs text-gray-200 rounded-lg transition-all">
@@ -1404,8 +1423,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     is_whitelisted = (
                         attacker_ip.startswith("10.88.0.") or 
                         attacker_ip.startswith("127.") or 
-                        attacker_ip.startswith("172.20.") or
-                        attacker_ip == "38.47.180.2"
+                        attacker_ip in EXTRA_WHITELIST_IPS
                     )
 
                     if attacker_ip and is_valid_ip and not is_whitelisted:
@@ -1519,8 +1537,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 is_whitelisted = (
                     attacker_ip.startswith("10.88.0.") or 
                     attacker_ip.startswith("127.") or 
-                    attacker_ip.startswith("172.20.") or
-                    attacker_ip == "38.47.180.2"
+                    attacker_ip in EXTRA_WHITELIST_IPS
                 )
 
                 if attacker_ip and is_valid_ip:
