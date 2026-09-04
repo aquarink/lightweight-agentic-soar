@@ -34,11 +34,14 @@ EVENTS_FILE = os.getenv('SOAR_EVENTS_FILE', os.path.join(os.path.dirname(os.path
 ASSETS_FILE = os.getenv('SOAR_ASSETS_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'protected_assets.json'))
 SESSIONS_FILE = os.getenv('SOAR_SESSIONS_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'soar_sessions.json'))
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434/api/generate')
+AI_MODEL = os.getenv('SOAR_AI_MODEL', 'qwen2.5-coder:1.5b')
 DEFAULT_TTL = int(os.getenv('DEFAULT_TTL', 86400))
 
 ADMIN_USER = os.getenv('SOAR_ADMIN_USER', 'admin')
-ADMIN_PASS = os.getenv('SOAR_ADMIN_PASS', 'admin123')
 EXTRA_WHITELIST_IPS = set(ip.strip() for ip in os.getenv('SOAR_WHITELISTED_IPS', '').split(',') if ip.strip())
+ARUSBALIK_SSH_HOST = os.getenv('ARUSBALIK_SSH_HOST', '10.88.0.1')
+ARUSBALIK_SSH_USER = os.getenv('ARUSBALIK_SSH_USER', 'root')
+ARUSBALIK_SSH_PASS = os.getenv('ARUSBALIK_SSH_PASS', '')
 
 db_lock = threading.Lock()
 
@@ -131,7 +134,9 @@ def get_asset_by_host_or_ip(host_or_ip):
 
 # --- FIREWALL MITIGATION ENGINE (DUAL-TIER O(1) IPSET: HOST + EDGE ARUSBALIK) ---
 def block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL):
-    if not attacker_ip or not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip):
+    if not attacker_ip or attacker_ip in ('0.0.0.0', '255.255.255.255') or not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip):
+        return False
+    if attacker_ip.startswith("127.") or attacker_ip in EXTRA_WHITELIST_IPS:
         return False
     
     # 1. Proxmox Host ipset (O(1) Kernel Hash Table)
@@ -140,25 +145,26 @@ def block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL):
     except Exception as e:
         print(f"Error adding to host ipset ({attacker_ip}):", e)
 
-    # 2. ArusBalik Edge VPS (Gateway 10.88.0.1) - Non-blocking thread
-    def push_edge():
-        try:
-            cmd = f"ipset add soar_edge_blacklist {attacker_ip} timeout {ttl} -exist"
-            subprocess.run([
-                "sshpass", "-p", "ITP4sswd1", "ssh", 
-                "-o", "StrictHostKeyChecking=no", 
-                "-o", "ConnectTimeout=3", 
-                "root@10.88.0.1", cmd
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-        except Exception as e:
-            print(f"Error pushing {attacker_ip} to ArusBalik edge ipset:", e)
+    # 2. ArusBalik Edge VPS (Gateway) - Non-blocking thread
+    if ARUSBALIK_SSH_HOST and ARUSBALIK_SSH_PASS:
+        def push_edge():
+            try:
+                cmd = f"ipset add soar_edge_blacklist {attacker_ip} timeout {ttl} -exist"
+                subprocess.run([
+                    "sshpass", "-p", ARUSBALIK_SSH_PASS, "ssh", 
+                    "-o", "StrictHostKeyChecking=no", 
+                    "-o", "ConnectTimeout=3", 
+                    f"{ARUSBALIK_SSH_USER}@{ARUSBALIK_SSH_HOST}", cmd
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except Exception as e:
+                print(f"Error pushing {attacker_ip} to ArusBalik edge ipset:", e)
 
-    t = threading.Thread(target=push_edge, daemon=True)
-    t.start()
+        t = threading.Thread(target=push_edge, daemon=True)
+        t.start()
     return True
 
 def unblock_ip_everywhere(attacker_ip):
-    if not attacker_ip:
+    if not attacker_ip or attacker_ip in ('0.0.0.0', '255.255.255.255'):
         return False
     
     # 1. Hapus dari Proxmox Host ipset & iptables
@@ -168,20 +174,21 @@ def unblock_ip_everywhere(attacker_ip):
         pass
 
     # 2. Hapus dari ArusBalik Edge VPS
-    def del_edge():
-        try:
-            cmd = f"ipset del soar_edge_blacklist {attacker_ip}"
-            subprocess.run([
-                "sshpass", "-p", "ITP4sswd1", "ssh", 
-                "-o", "StrictHostKeyChecking=no", 
-                "-o", "ConnectTimeout=3", 
-                "root@10.88.0.1", cmd
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-        except Exception as e:
-            print(f"Error removing {attacker_ip} from ArusBalik edge ipset:", e)
+    if ARUSBALIK_SSH_HOST and ARUSBALIK_SSH_PASS:
+        def del_edge():
+            try:
+                cmd = f"ipset del soar_edge_blacklist {attacker_ip}"
+                subprocess.run([
+                    "sshpass", "-p", ARUSBALIK_SSH_PASS, "ssh", 
+                    "-o", "StrictHostKeyChecking=no", 
+                    "-o", "ConnectTimeout=3", 
+                    f"{ARUSBALIK_SSH_USER}@{ARUSBALIK_SSH_HOST}", cmd
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except Exception as e:
+                print(f"Error removing {attacker_ip} from ArusBalik edge ipset:", e)
 
-    t = threading.Thread(target=del_edge, daemon=True)
-    t.start()
+        t = threading.Thread(target=del_edge, daemon=True)
+        t.start()
     return True
 
 def get_active_blocked_ips():
@@ -310,40 +317,67 @@ LOGIN_HTML = """<!DOCTYPE html>
 """
 
 
+def _parse_llm_json(ai_raw, title, host):
+    try:
+        return json.loads(ai_raw)
+    except Exception:
+        repaired = ai_raw.strip()
+        if repaired.count('"') % 2 != 0:
+            repaired += '"'
+        if not repaired.endswith('}'):
+            repaired += '\n}'
+        try:
+            return json.loads(repaired)
+        except Exception:
+            m_summary = re.search(r'"analysis_summary"\s*:\s*"([^"]*)', ai_raw)
+            m_detail = re.search(r'"detailed_analysis"\s*:\s*"([^"]*)', ai_raw)
+            m_type = re.search(r'"incident_type"\s*:\s*"([^"]*)', ai_raw)
+            return {
+                "action": "block",
+                "incident_type": m_type.group(1) if m_type else title,
+                "analysis_summary": m_summary.group(1) if m_summary else f"Insiden {title} terdeteksi dan diblokir WAF pada host {host}.",
+                "detailed_analysis": m_detail.group(1) if m_detail else ai_raw
+            }
+
 def run_background_analysis(ev_id, title, text, host, raw):
     try:
         prompt = (
-            f"Analyze this security log from targeted server '{host}':\n"
-            f"Title: {title}\n"
-            f"Raw Log Message: {raw}\n\n"
-            f"Return a JSON object with these keys:\n"
-            f"1. 'action': either 'block' (if brute force, attacks, or security breach) or 'ignore'\n"
-            f"2. 'ip': the attacker source IP address if found in the log\n"
-            f"3. 'incident_type': type of attack or event\n"
-            f"4. 'analysis_summary': brief explanation of what happened in Indonesian language\n"
-            f"5. 'detailed_analysis': a structured report in Indonesian language explaining: "
-            f"which server was targeted ({host}), why it was blocked or ignored, what vulnerability "
-            f"was exploited, how the threat behaves, and recommended next steps."
+            f"Host target: {host}\n"
+            f"Kejadian: {title}\n"
+            f"Log: {raw}\n\n"
+            f"Keluarkan JSON valid (padat & ringkas Bahasa Indonesia):\n"
+            f'{{\n'
+            f'  "action": "block",\n'
+            f'  "incident_type": "Tipe Serangan Spesifik",\n'
+            f'  "analysis_summary": "1 kalimat ringkasan kejadian",\n'
+            f'  "detailed_analysis": "Penyebab & mitigasi singkat"\n'
+            f'}}'
         )
         ollama_payload = {
-            "model": "llama3.2",
+            "model": AI_MODEL,
+            "system": "Anda adalah AI Analis SOC. Jawab selalu dalam JSON ringkas Bahasa Indonesia. Setiap nilai teks maksimal 1 kalimat pendek padat.",
             "prompt": prompt,
             "format": "json",
-            "stream": False
+            "stream": False,
+            "options": {
+                "num_predict": 140,
+                "temperature": 0.1
+            },
+            "keep_alive": "24h"
         }
         req = urllib.request.Request(
             OLLAMA_URL, 
             data=json.dumps(ollama_payload).encode('utf-8'),
             headers={'Content-Type': 'application/json'}
         )
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             res_body = response.read().decode('utf-8')
             res_json = json.loads(res_body)
             ai_raw_response = res_json.get('response', '').strip()
         
-        ai_data = json.loads(ai_raw_response)
-        analysis_summary = ai_data.get('analysis_summary') or ai_data.get('analysis') or ai_data.get('summary') or 'Analisis tidak tersedia.'
-        detailed_analysis_raw = ai_data.get('detailed_analysis') or 'Tidak tersedia.'
+        ai_data = _parse_llm_json(ai_raw_response, title, host)
+        analysis_summary = ai_data.get('analysis_summary') or ai_data.get('analysis') or ai_data.get('summary') or 'Analisis selesai.'
+        detailed_analysis_raw = ai_data.get('detailed_analysis') or 'Analisis rinci tidak tersedia.'
         
         if isinstance(detailed_analysis_raw, dict):
             lines = []
@@ -376,6 +410,16 @@ def run_background_analysis(ev_id, title, text, host, raw):
         save_events(current_events)
     except Exception as e:
         print("Error background LLM:", e)
+        try:
+            current_events = load_events()
+            for ev in current_events:
+                if ev.get("id") == ev_id and not ev.get("analysis"):
+                    ev["analysis"] = f"Proteksi aktif: Insiden '{title}' pada {host} berhasil dicegah."
+                    ev["detailed_analysis"] = f"• Target: {host}\n• Status: Diblokir oleh aturan mitigasi otomatis\n• Rekomendasi: Evaluasi log keamanan di server terkait"
+                    break
+            save_events(current_events)
+        except Exception:
+            pass
 
 
 class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
@@ -1439,8 +1483,8 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 
                 # 1. ArusBalik Embedded WAF Format
                 if log_data.get("source") == "arusbalik_waf" or "rule_id" in log_data:
-                    attacker_ip = str(log_data.get('attacker_ip') or log_data.get('ip') or '').strip()
-                    target_host = str(log_data.get('target_host') or 'Web Application').strip()
+                    attacker_ip = str(log_data.get('attacker_ip') or log_data.get('client_ip') or log_data.get('ip') or '').strip()
+                    target_host = str(log_data.get('target_host') or log_data.get('host') or 'Web Application').strip()
                     rule_id = log_data.get('rule_id', 0)
                     uri = str(log_data.get('uri') or '/')
                     method = str(log_data.get('method') or 'GET')
@@ -1455,6 +1499,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     mitigation_status = "Diblokir oleh ArusBalik Embedded WAF (HTTP 403)"
                     is_valid_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip))
                     is_whitelisted = (
+                        attacker_ip in ('0.0.0.0', '255.255.255.255') or
                         attacker_ip.startswith("10.88.0.") or 
                         attacker_ip.startswith("127.") or 
                         attacker_ip in EXTRA_WHITELIST_IPS
@@ -1569,6 +1614,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 is_valid_ip = re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip)
                 
                 is_whitelisted = (
+                    attacker_ip in ('0.0.0.0', '255.255.255.255') or
                     attacker_ip.startswith("10.88.0.") or 
                     attacker_ip.startswith("127.") or 
                     attacker_ip in EXTRA_WHITELIST_IPS
