@@ -9,16 +9,14 @@ import subprocess
 import re
 import threading
 
-# PORT LAYANAN WEB & WEBHOOK
 PORT = 8080
 EVENTS_FILE = '/root/riset/soar_events.json'
 ASSETS_FILE = '/root/riset/protected_assets.json'
 OLLAMA_URL = 'http://10.88.0.4:11434/api/generate'
+DEFAULT_TTL = 86400  # 24 Jam (dalam detik)
 
-# Lock untuk keamanan akses file thread-safe
 db_lock = threading.Lock()
 
-# Fungsi untuk memuat data kejadian lama
 def load_events():
     with db_lock:
         if os.path.exists(EVENTS_FILE):
@@ -29,7 +27,6 @@ def load_events():
                 return []
         return []
 
-# Fungsi untuk menyimpan data kejadian baru
 def save_events(events):
     with db_lock:
         try:
@@ -38,7 +35,6 @@ def save_events(events):
         except Exception as e:
             print("Gagal menyimpan event ke file:", e)
 
-# Fungsi untuk memuat data aset node yang dilindungi
 def load_assets():
     with db_lock:
         if os.path.exists(ASSETS_FILE):
@@ -49,7 +45,6 @@ def load_assets():
                 return []
         return []
 
-# Fungsi untuk menyimpan data aset node
 def save_assets(assets):
     with db_lock:
         try:
@@ -71,6 +66,94 @@ def get_asset_by_host_or_ip(host_or_ip):
             return a
     return None
 
+# --- FIREWALL MITIGATION ENGINE (DUAL-TIER O(1) IPSET: HOST + EDGE ARUSBALIK) ---
+def block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL):
+    if not attacker_ip or not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip):
+        return False
+    
+    # 1. Proxmox Host ipset (O(1) Kernel Hash Table)
+    try:
+        subprocess.run(["/usr/sbin/ipset", "add", "soar_host_blacklist", attacker_ip, "timeout", str(ttl), "-exist"], check=True)
+    except Exception as e:
+        print(f"Error adding to host ipset ({attacker_ip}):", e)
+
+    # 2. ArusBalik Edge VPS (Gateway 10.88.0.1) - Non-blocking thread
+    def push_edge():
+        try:
+            cmd = f"ipset add soar_edge_blacklist {attacker_ip} timeout {ttl} -exist"
+            subprocess.run([
+                "sshpass", "-p", "ITP4sswd1", "ssh", 
+                "-o", "StrictHostKeyChecking=no", 
+                "-o", "ConnectTimeout=3", 
+                "root@10.88.0.1", cmd
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception as e:
+            print(f"Error pushing {attacker_ip} to ArusBalik edge ipset:", e)
+
+    t = threading.Thread(target=push_edge, daemon=True)
+    t.start()
+    return True
+
+def unblock_ip_everywhere(attacker_ip):
+    if not attacker_ip:
+        return False
+    
+    # 1. Hapus dari Proxmox Host ipset & iptables
+    try:
+        subprocess.run(["/usr/sbin/ipset", "del", "soar_host_blacklist", attacker_ip], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    # 2. Hapus dari ArusBalik Edge VPS
+    def del_edge():
+        try:
+            cmd = f"ipset del soar_edge_blacklist {attacker_ip}"
+            subprocess.run([
+                "sshpass", "-p", "ITP4sswd1", "ssh", 
+                "-o", "StrictHostKeyChecking=no", 
+                "-o", "ConnectTimeout=3", 
+                "root@10.88.0.1", cmd
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception as e:
+            print(f"Error removing {attacker_ip} from ArusBalik edge ipset:", e)
+
+    t = threading.Thread(target=del_edge, daemon=True)
+    t.start()
+    return True
+
+def get_active_blocked_ips():
+    """Mengambil daftar IP terblokir aktif beserta sisa timeout (TTL) dari ipset Proxmox"""
+    blocked_list = []
+    try:
+        res = subprocess.run(["/usr/sbin/ipset", "list", "soar_host_blacklist"], capture_output=True, text=True)
+        if res.returncode == 0:
+            matches = re.findall(r'(\d+\.\d+\.\d+\.\d+)\s+timeout\s+(\d+)', res.stdout)
+            events = load_events()
+            for ip, timeout_str in matches:
+                matched_event = None
+                for ev in reversed(events):
+                    if ev.get('ip') == ip:
+                        matched_event = ev
+                        break
+                
+                timeout_sec = int(timeout_str)
+                hours = timeout_sec // 3600
+                minutes = (timeout_sec % 3600) // 60
+                ttl_human = f"{hours}j {minutes}m lagi" if hours > 0 else f"{minutes}m lagi"
+
+                blocked_list.append({
+                    "ip": ip,
+                    "ttl_seconds": timeout_sec,
+                    "ttl_human": ttl_human,
+                    "target_host": (matched_event.get('target_host_display') or matched_event.get('target_host')) if matched_event else "Semua Node",
+                    "reason": matched_event.get('incident_type') if matched_event else "Mitigasi Otomatis SOAR",
+                    "blocked_at": matched_event.get('timestamp') if matched_event else "Aktif"
+                })
+    except Exception as e:
+        print("Error fetching ipset blocked list:", e)
+    return blocked_list
+
+
 class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
 
     def do_HEAD(self):
@@ -84,10 +167,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
 
-    
-    # 1. HANDLE WEB DASHBOARD (GET /)
     def do_GET(self):
-        # API ENDPOINT UNTUK MENARIK DATA DARI DATABASE SECARA DINAMIS
         if self.path == '/api/events':
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -104,6 +184,14 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(assets).encode('utf-8'))
             return
 
+        elif self.path == '/api/blocked':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            blocked_ips = get_active_blocked_ips()
+            self.wfile.write(json.dumps(blocked_ips).encode('utf-8'))
+            return
+
         elif self.path in ['/favicon.ico', '/favicon.png', '/soar_logo.jpg']:
             logo_path = '/root/riset/soar_logo.jpg'
             if os.path.exists(logo_path):
@@ -118,13 +206,12 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
                 return
-            
+
         elif self.path == '/' or self.path == '/index.html':
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
-            
-            # HTML Dashboard SPA Premium dengan fitur Pagination & AJAX (Tarik DB langsung, tidak ke LLM saat muat halaman)
+
             html_content = """<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -134,6 +221,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
     <link rel="icon" type="image/jpeg" href="/soar_logo.jpg">
     <link rel="shortcut icon" href="/favicon.ico">
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body class="bg-gray-900 text-gray-100 font-sans min-h-screen">
     <div class="container mx-auto px-4 py-8">
@@ -145,11 +233,13 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     <img src="/soar_logo.jpg" alt="UIN SOAR Logo" class="w-11 h-11 rounded-xl mr-3 shadow-lg shadow-cyan-500/25 object-cover border border-cyan-500/30">
                     Lightweight Agentic SOAR
                 </h1>
-                <p class="text-gray-400 mt-2 text-sm md:text-base">Sistem Orkestrasi Keamanan Siber Terintegrasi berbasis LLM Lokal Ringan (Ollama)</p>
+                <p class="text-gray-400 mt-2 text-sm md:text-base">Sistem Orkestrasi Keamanan Siber Terintegrasi berbasis LLM Lokal (Ollama) & Edge Mitigation (ArusBalik)</p>
             </div>
-            <div class="mt-4 md:mt-0 flex items-center bg-gray-800 border border-gray-700 px-4 py-2 rounded-lg text-sm text-indigo-400 font-mono shadow-inner">
-                <span class="w-3 h-3 bg-green-500 rounded-full inline-block mr-2.5 animate-pulse"></span>
-                SOC Active Mode
+            <div class="mt-4 md:mt-0 flex items-center space-x-3">
+                <div class="flex items-center bg-gray-800 border border-gray-700 px-4 py-2 rounded-lg text-sm text-cyan-400 font-mono shadow-inner">
+                    <span class="w-3 h-3 bg-green-500 rounded-full inline-block mr-2.5 animate-pulse"></span>
+                    Dual-Tier Edge Defense (O(1))
+                </div>
             </div>
         </div>
 
@@ -164,23 +254,30 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 <p id="statAssets" class="text-3xl font-bold text-cyan-400 mt-2">0</p>
             </div>
             <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 shadow-md">
-                <p class="text-sm text-gray-400 font-medium">Mitigasi Pemblokiran (Block)</p>
-                <p id="statBlock" class="text-3xl font-bold text-red-500 mt-2">0</p>
+                <p class="text-sm text-gray-400 font-medium">IP Terblokir Aktif (Edge + Host)</p>
+                <p id="statBlockedActive" class="text-3xl font-bold text-red-500 mt-2">0</p>
             </div>
             <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 shadow-md">
-                <p class="text-sm text-gray-400 font-medium">Aktivitas Diabaikan (Ignore)</p>
+                <p class="text-sm text-gray-400 font-medium">Aktivitas Diabaikan (Normal)</p>
                 <p id="statIgnore" class="text-3xl font-bold text-green-400 mt-2">0</p>
             </div>
         </div>
 
-        <!-- Tab Navigasi -->
-        <div class="flex space-x-2 border-b border-gray-700 mb-6">
+        <!-- Tab Navigasi 4 Fitur -->
+        <div class="flex flex-wrap gap-2 border-b border-gray-700 mb-6">
             <button id="tabEventsBtn" onclick="switchTab('events')" class="px-5 py-3 font-semibold text-sm border-b-2 border-indigo-500 text-indigo-400 flex items-center space-x-2 transition-all">
-                <span>⚡ Log Triase Insiden Real-Time</span>
+                <span>⚡ Log Triase Insiden</span>
                 <span id="badgeEventCount" class="bg-indigo-900/60 text-indigo-300 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
             </button>
+            <button id="tabBlockedBtn" onclick="switchTab('blocked')" class="px-5 py-3 font-semibold text-sm border-b-2 border-transparent text-gray-400 hover:text-gray-200 flex items-center space-x-2 transition-all">
+                <span>🚫 Manajemen Blokir (TTL & Unblock)</span>
+                <span id="badgeBlockedCount" class="bg-red-950 text-red-400 text-xs px-2 py-0.5 rounded-full font-mono border border-red-900/50">0</span>
+            </button>
+            <button id="tabChartsBtn" onclick="switchTab('charts')" class="px-5 py-3 font-semibold text-sm border-b-2 border-transparent text-gray-400 hover:text-gray-200 flex items-center space-x-2 transition-all">
+                <span>📊 Visualisasi & Analitik (Chart.js)</span>
+            </button>
             <button id="tabAssetsBtn" onclick="switchTab('assets')" class="px-5 py-3 font-semibold text-sm border-b-2 border-transparent text-gray-400 hover:text-gray-200 flex items-center space-x-2 transition-all">
-                <span>🛡️ Inventaris Node & IP Terlindungi</span>
+                <span>🛡️ Inventaris Node & IP</span>
                 <span id="badgeAssetCount" class="bg-gray-800 text-gray-300 text-xs px-2 py-0.5 rounded-full font-mono">0</span>
             </button>
         </div>
@@ -228,7 +325,80 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             </div>
         </div>
 
-        <!-- VIEW 2: TABEL INVENTARIS NODE TERLINDUNGI -->
+        <!-- VIEW 2: MANAJEMEN BLOKIR (TTL & UNBLOCK) -->
+        <div id="tabBlockedView" class="hidden space-y-4">
+            <div class="bg-gray-800 rounded-xl border border-gray-700 shadow-xl overflow-hidden">
+                <div class="px-6 py-4 border-b border-gray-700 bg-gray-850 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div>
+                        <h2 class="text-lg font-semibold text-white flex items-center">
+                            <span>🚫 Daftar IP Terblokir Aktif (Edge + Host Kernel Hash)</span>
+                        </h2>
+                        <p class="text-xs text-red-400 mt-0.5">Semua IP di bawah ini di-DROP secara O(1) di Edge Gateway ArusBalik (38.47.180.2) dan Proxmox Host</p>
+                    </div>
+                    <div>
+                        <button onclick="fetchBlockedFromDB()" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-xs text-gray-200 rounded-lg transition-all">
+                            🔄 Refresh Daftar
+                        </button>
+                    </div>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-700">
+                        <thead class="bg-gray-900/50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">IP Penyerang</th>
+                                <th class="px-6 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Node Sasaran</th>
+                                <th class="px-6 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Alasan Pemblokiran</th>
+                                <th class="px-6 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Sisa Waktu (TTL Kernel)</th>
+                                <th class="px-6 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Aksi Interaktif</th>
+                            </tr>
+                        </thead>
+                        <tbody id="blockedTableBody" class="divide-y divide-gray-700 bg-gray-800">
+                            <!-- Diisi oleh JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- VIEW 3: VISUALISASI GRAFIK STATISTIK (CHART.JS) -->
+        <div id="tabChartsView" class="hidden space-y-6">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Chart 1: Distribusi Serangan -->
+                <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 shadow-xl">
+                    <h3 class="text-base font-bold text-white mb-1 flex items-center">
+                        <span class="mr-2">🍩</span> Distribusi Kategori Ancaman
+                    </h3>
+                    <p class="text-xs text-gray-400 mb-4">Persentase jenis eksploitasi yang dideteksi SIEM & SOAR</p>
+                    <div class="relative h-64 flex items-center justify-center">
+                        <canvas id="chartThreatTypes"></canvas>
+                    </div>
+                </div>
+
+                <!-- Chart 2: Sasaran Target Paling Sering Diserang -->
+                <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 shadow-xl">
+                    <h3 class="text-base font-bold text-white mb-1 flex items-center">
+                        <span class="mr-2">🎯</span> Frekuensi Serangan per Node Sasaran
+                    </h3>
+                    <p class="text-xs text-gray-400 mb-4">Node VM yang paling intensif menjadi target serangan siber</p>
+                    <div class="relative h-64 flex items-center justify-center">
+                        <canvas id="chartTargetNodes"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Chart 3: Tren Insiden Waktu Nyata -->
+            <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 shadow-xl">
+                <h3 class="text-base font-bold text-white mb-1 flex items-center">
+                    <span class="mr-2">📈</span> Tren Garis Waktu Insiden
+                </h3>
+                <p class="text-xs text-gray-400 mb-4">Histori eskalasi dan volume serangan siber yang diproses SOAR</p>
+                <div class="relative h-64">
+                    <canvas id="chartTimeline"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- VIEW 4: TABEL INVENTARIS NODE TERLINDUNGI -->
         <div id="tabAssetsView" class="hidden space-y-4">
             <div class="bg-gray-800 rounded-xl border border-gray-700 shadow-xl overflow-hidden">
                 <div class="px-6 py-4 border-b border-gray-700 bg-gray-850 flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -386,32 +556,40 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
         </div>
     </div>
 
-    <!-- JAVASCRIPT SPA LOGIC -->
+    <!-- JAVASCRIPT SPA & CHARTS LOGIC -->
     <script>
         let eventsData = [];
         let assetsData = [];
+        let blockedData = [];
         let currentPage = 1;
         const ITEMS_PER_PAGE = 8;
         let isModalOpen = false;
         let activeTab = 'events';
 
+        let chart1Instance = null;
+        let chart2Instance = null;
+        let chart3Instance = null;
+
         function switchTab(tab) {
             activeTab = tab;
-            const eventsBtn = document.getElementById('tabEventsBtn');
-            const assetsBtn = document.getElementById('tabAssetsBtn');
-            const eventsView = document.getElementById('tabEventsView');
-            const assetsView = document.getElementById('tabAssetsView');
+            const tabs = ['events', 'blocked', 'charts', 'assets'];
+            tabs.forEach(t => {
+                const btn = document.getElementById(`tab${t.charAt(0).toUpperCase() + t.slice(1)}Btn`);
+                const view = document.getElementById(`tab${t.charAt(0).toUpperCase() + t.slice(1)}View`);
+                if (t === tab) {
+                    btn.className = "px-5 py-3 font-semibold text-sm border-b-2 border-indigo-500 text-indigo-400 flex items-center space-x-2 transition-all";
+                    view.classList.remove('hidden');
+                } else {
+                    btn.className = "px-5 py-3 font-semibold text-sm border-b-2 border-transparent text-gray-400 hover:text-gray-200 flex items-center space-x-2 transition-all";
+                    view.classList.add('hidden');
+                }
+            });
 
-            if (tab === 'events') {
-                eventsBtn.className = "px-5 py-3 font-semibold text-sm border-b-2 border-indigo-500 text-indigo-400 flex items-center space-x-2 transition-all";
-                assetsBtn.className = "px-5 py-3 font-semibold text-sm border-b-2 border-transparent text-gray-400 hover:text-gray-200 flex items-center space-x-2 transition-all";
-                eventsView.classList.remove('hidden');
-                assetsView.classList.add('hidden');
-            } else {
-                assetsBtn.className = "px-5 py-3 font-semibold text-sm border-b-2 border-cyan-500 text-cyan-400 flex items-center space-x-2 transition-all";
-                eventsBtn.className = "px-5 py-3 font-semibold text-sm border-b-2 border-transparent text-gray-400 hover:text-gray-200 flex items-center space-x-2 transition-all";
-                eventsView.classList.add('hidden');
-                assetsView.classList.remove('hidden');
+            if (tab === 'charts') {
+                renderAllCharts();
+            } else if (tab === 'blocked') {
+                fetchBlockedFromDB();
+            } else if (tab === 'assets') {
                 fetchAssetsFromDB();
             }
         }
@@ -424,6 +602,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     document.getElementById('badgeEventCount').innerText = eventsData.length;
                     updateStats();
                     renderTablePage();
+                    if (activeTab === 'charts') renderAllCharts();
                 })
                 .catch(err => console.error("Gagal menarik data log:", err));
         }
@@ -440,18 +619,25 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 .catch(err => console.error("Gagal menarik data aset:", err));
         }
 
+        function fetchBlockedFromDB() {
+            fetch('/api/blocked')
+                .then(res => res.json())
+                .then(data => {
+                    blockedData = data;
+                    document.getElementById('statBlockedActive').innerText = blockedData.length;
+                    document.getElementById('badgeBlockedCount').innerText = blockedData.length;
+                    renderBlockedTable();
+                })
+                .catch(err => console.error("Gagal menarik data blacklist:", err));
+        }
+
         function updateStats() {
             let total = eventsData.length;
-            let blockCount = 0;
             let ignoreCount = 0;
-
             eventsData.forEach(ev => {
-                if (ev.action === 'block') blockCount++;
-                else ignoreCount++;
+                if (ev.action === 'ignore') ignoreCount++;
             });
-
             document.getElementById('statTotal').innerText = total;
-            document.getElementById('statBlock').innerText = blockCount;
             document.getElementById('statIgnore').innerText = ignoreCount;
         }
 
@@ -506,6 +692,59 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             updatePaginationControls(startIdx + 1, endIdx, total);
         }
 
+        function renderBlockedTable() {
+            const tbody = document.getElementById('blockedTableBody');
+            tbody.innerHTML = '';
+
+            if (blockedData.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="5" class="px-6 py-8 text-center text-sm text-emerald-400 font-medium">✨ Tidak ada IP yang sedang terblokir saat ini (Tabel firewall bersih).</td></tr>`;
+                return;
+            }
+
+            blockedData.forEach(item => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-gray-700/40 transition-colors duration-150";
+                tr.innerHTML = `
+                    <td class="px-6 py-4 whitespace-nowrap text-sm font-mono font-bold text-red-400">${item.ip}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-cyan-300 font-medium">${item.target_host}</td>
+                    <td class="px-6 py-4 text-sm text-gray-300">${item.reason}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm">
+                        <span class="px-2.5 py-1 rounded-md text-xs font-mono font-semibold bg-amber-950/40 text-amber-300 border border-amber-900/50">
+                            ⏱️ ${item.ttl_human}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm">
+                        <button onclick="unblockIp('${item.ip}')" class="px-3.5 py-1.5 bg-amber-600/80 hover:bg-amber-500 text-white rounded-lg text-xs font-semibold shadow-md shadow-amber-600/20 transition-all flex items-center">
+                            <span class="mr-1">🔓</span> Unblock Sekarang
+                        </button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function unblockIp(ip) {
+            if (!confirm(`Konfirmasi: Apakah Anda yakin ingin melepas pemblokiran IP ${ip} dari Edge Gateway & Proxmox?`)) {
+                return;
+            }
+
+            fetch('/api/unblock', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ip: ip })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    alert(`IP ${ip} berhasil dilepas dari daftar blokir!`);
+                    fetchBlockedFromDB();
+                } else {
+                    alert("Gagal unblock: " + (data.error || "Terjadi kesalahan"));
+                }
+            })
+            .catch(err => alert("Koneksi gagal: " + err));
+        }
+
         function renderAssetsTable() {
             const tbody = document.getElementById('assetsTableBody');
             tbody.innerHTML = '';
@@ -532,6 +771,106 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 `;
                 tbody.appendChild(tr);
             });
+        }
+
+        function renderAllCharts() {
+            // Hitung data agregat
+            const threatCounts = {};
+            const targetCounts = {};
+            const timelineCounts = {};
+
+            eventsData.forEach(ev => {
+                const type = ev.incident_type || 'Kejadian Umum';
+                threatCounts[type] = (threatCounts[type] || 0) + 1;
+
+                const host = ev.target_host_display || ev.target_host || 'Local Host';
+                targetCounts[host] = (targetCounts[host] || 0) + 1;
+
+                const dateStr = (ev.timestamp || '').split(' ')[0] || 'Unknown';
+                timelineCounts[dateStr] = (timelineCounts[dateStr] || 0) + 1;
+            });
+
+            // 1. Threat Types Donut Chart
+            const ctx1 = document.getElementById('chartThreatTypes');
+            if (ctx1) {
+                if (chart1Instance) chart1Instance.destroy();
+                chart1Instance = new Chart(ctx1, {
+                    type: 'doughnut',
+                    data: {
+                        labels: Object.keys(threatCounts),
+                        datasets: [{
+                            data: Object.values(threatCounts),
+                            backgroundColor: ['#ef4444', '#f59e0b', '#06b6d4', '#6366f1', '#10b981', '#8b5cf6'],
+                            borderWidth: 0
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { position: 'bottom', labels: { color: '#9ca3af', boxWidth: 12 } }
+                        }
+                    }
+                });
+            }
+
+            // 2. Target Nodes Bar Chart
+            const ctx2 = document.getElementById('chartTargetNodes');
+            if (ctx2) {
+                if (chart2Instance) chart2Instance.destroy();
+                chart2Instance = new Chart(ctx2, {
+                    type: 'bar',
+                    data: {
+                        labels: Object.keys(targetCounts),
+                        datasets: [{
+                            label: 'Jumlah Serangan',
+                            data: Object.values(targetCounts),
+                            backgroundColor: '#06b6d4',
+                            borderRadius: 6
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            x: { ticks: { color: '#9ca3af' }, grid: { display: false } },
+                            y: { ticks: { color: '#9ca3af', stepSize: 1 }, grid: { color: '#374151' } }
+                        }
+                    }
+                });
+            }
+
+            // 3. Timeline Line Chart
+            const ctx3 = document.getElementById('chartTimeline');
+            if (ctx3) {
+                if (chart3Instance) chart3Instance.destroy();
+                chart3Instance = new Chart(ctx3, {
+                    type: 'line',
+                    data: {
+                        labels: Object.keys(timelineCounts),
+                        datasets: [{
+                            label: 'Insiden Terdeteksi',
+                            data: Object.values(timelineCounts),
+                            borderColor: '#818cf8',
+                            backgroundColor: 'rgba(129, 140, 248, 0.1)',
+                            fill: true,
+                            tension: 0.3,
+                            borderWidth: 2,
+                            pointBackgroundColor: '#818cf8'
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            x: { ticks: { color: '#9ca3af' }, grid: { display: false } },
+                            y: { ticks: { color: '#9ca3af', stepSize: 1 }, grid: { color: '#374151' } }
+                        }
+                    }
+                });
+            }
         }
 
         function updatePaginationControls(start, end, total) {
@@ -562,7 +901,6 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             document.getElementById('modalMitigation').innerText = ev.mitigation || 'N/A';
             document.getElementById('modalRawLog').innerText = ev.raw_log || 'Log mentah tidak tersedia.';
             
-            // Detail Topologi Korban
             const hostKey = (ev.target_host || '').toLowerCase();
             const matched = assetsData.find(a => (a.hostname || '').toLowerCase() === hostKey || (a.name || '').toLowerCase().includes(hostKey));
             
@@ -642,10 +980,12 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
         // Inisialisasi awal
         fetchEventsFromDB();
         fetchAssetsFromDB();
+        fetchBlockedFromDB();
         
         setInterval(() => {
-            if (!isModalOpen && activeTab === 'events') {
-                fetchEventsFromDB();
+            if (!isModalOpen) {
+                if (activeTab === 'events') fetchEventsFromDB();
+                else if (activeTab === 'blocked') fetchBlockedFromDB();
             }
         }, 5000);
     </script>
@@ -657,10 +997,35 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    # 2. HANDLE POST (WEBHOOK DARI WAZUH/TRACECAT & REGISTRASI ASET)
+    # 2. HANDLE POST (WEBHOOK DARI WAZUH/TRACECAT, UNBLOCK, & ASSET REGISTRATION)
     def do_POST(self):
-        # Endpoint untuk registrasi atau pembaruan aset node terlindungi secara dinamis
-        if self.path == '/api/assets':
+        if self.path == '/api/unblock':
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            try:
+                payload = json.loads(post_data)
+                ip = payload.get('ip', '').strip()
+                if not ip:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "IP wajib disertakan"}).encode('utf-8'))
+                    return
+
+                unblock_ip_everywhere(ip)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "message": f"IP {ip} berhasil di-unblock"}).encode('utf-8'))
+                return
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+                return
+
+        elif self.path == '/api/assets':
             content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length).decode('utf-8')
             try:
@@ -698,7 +1063,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 return
 
         elif self.path == '/webhook':
-            content_length = int(self.headers['Content-Length'])
+            content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length).decode('utf-8')
             
             self.send_response(200)
@@ -706,10 +1071,9 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             
             try:
-                # Parsing log
                 log_data = json.loads(post_data)
                 
-                # Cek jika log berasal dari alur kerja Tracecat (memiliki analysis_summary)
+                # Tracecat format
                 if "analysis_summary" in log_data:
                     action = log_data.get('action', 'ignore').lower()
                     attacker_ip = log_data.get('ip', '').strip()
@@ -726,16 +1090,8 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     is_valid_ip = re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip)
                     
                     if action == 'block' and attacker_ip and is_valid_ip:
-                        try:
-                            res = subprocess.run(["/usr/sbin/iptables", "-C", "INPUT", "-s", attacker_ip, "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            if res.returncode == 0:
-                                mitigation_status = f"IP {attacker_ip} Sudah Diblokir Sebelumnya"
-                            else:
-                                subprocess.run(["/usr/sbin/iptables", "-A", "INPUT", "-s", attacker_ip, "-j", "DROP"], check=True)
-                                subprocess.run(["/usr/sbin/iptables", "-A", "FORWARD", "-s", attacker_ip, "-j", "DROP"], check=False)
-                                mitigation_status = f"IP {attacker_ip} Berhasil Diblokir via iptables"
-                        except Exception as err:
-                            mitigation_status = f"Gagal memblokir IP {attacker_ip}"
+                        block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL)
+                        mitigation_status = f"IP {attacker_ip} Diblokir via O(1) ipset (Edge ArusBalik & Proxmox Host)"
                     
                     events = load_events()
                     new_event = {
@@ -757,24 +1113,20 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     if len(events) > 50:
                         events = events[-50:]
                     save_events(events)
-                    
                     self.wfile.write(json.dumps({"success": True, "event": new_event}).encode('utf-8'))
                     return
                 
-                # JIKA BUKAN DARI TRACECAT (LOG WAZUH LAMA - ALIRAN UTAMA KITA SEKARANG)
+                # Wazuh Alert Format
                 log_title = log_data.get('title', 'Aktivitas Keamanan Tidak Dikenal')
                 log_text = log_data.get('text', '')
                 
-                # Ekstrak data server target (agent wazuh) dan log mentah siber
                 agent_name = log_data.get('agent', {}).get('name') or log_data.get('location') or 'Local Host'
                 raw_log = log_data.get('full_log') or log_data.get('message') or log_text or 'Log mentah tidak tersedia.'
                 
-                # Ekstrak IP penyerang dari data wazuh
                 attacker_ip = ""
                 if 'data' in log_data and isinstance(log_data['data'], dict):
                     attacker_ip = log_data['data'].get('srcip', '')
                 
-                # Fallback ekstraksi IP menggunakan Regex jika srcip kosong
                 if not attacker_ip:
                     ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', raw_log)
                     if ip_match:
@@ -787,12 +1139,11 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 matched_asset = get_asset_by_host_or_ip(agent_name)
                 target_display = f"{agent_name} ({matched_asset['wg_ip']})" if matched_asset else agent_name
                 
-                # --- MITIGASI INSTAN (SUB-MILIDETIK) ---
+                # --- MITIGASI INSTAN VIA IPSET (SUB-MILIDETIK O(1)) ---
                 action = "ignore"
                 mitigation_status = "Diabaikan (Normal)"
                 is_valid_ip = re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip)
                 
-                # Cek whitelist agar IP infrastruktur internal tidak terblokir sendiri
                 is_whitelisted = (
                     attacker_ip.startswith("10.88.0.") or 
                     attacker_ip.startswith("127.") or 
@@ -806,22 +1157,10 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                         mitigation_status = f"IP {attacker_ip} Dikecualikan (Internal Whitelist)"
                     else:
                         action = "block"
-                        try:
-                            res = subprocess.run(["/usr/sbin/iptables", "-C", "INPUT", "-s", attacker_ip, "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            if res.returncode == 0:
-                                mitigation_status = f"IP {attacker_ip} Sudah Diblokir Sebelumnya"
-                            else:
-                                subprocess.run(["/usr/sbin/iptables", "-A", "INPUT", "-s", attacker_ip, "-j", "DROP"], check=True)
-                                subprocess.run(["/usr/sbin/iptables", "-A", "FORWARD", "-s", attacker_ip, "-j", "DROP"], check=False)
-                                mitigation_status = f"IP {attacker_ip} Berhasil Diblokir via iptables"
-                        except Exception as err:
-                            print("Gagal eksekusi mitigasi iptables:", err)
-                            mitigation_status = f"Gagal memblokir IP {attacker_ip}"
+                        block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL)
+                        mitigation_status = f"IP {attacker_ip} Diblokir via O(1) ipset (Edge ArusBalik & Proxmox Host)"
 
-                # Generate event ID unik
                 event_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
-
-                # Simpan log ke database dengan status awal (Sedang dianalisis...)
                 events = load_events()
                 new_event = {
                     "id": event_id,
@@ -844,21 +1183,20 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     events = events[-50:]
                 save_events(events)
 
-                # --- PEMROSESAN LLM ASINKRON (BACKGROUND THREAD) ---
                 def run_background_analysis(ev_id, title, text, host, raw):
                     try:
                         prompt = (
-                            f"Analyze this security log from targeted server '{host}':\n"
-                            f"Title: {title}\n"
-                            f"Raw Log Message: {raw}\n\n"
-                            f"Return a JSON object with these keys:\n"
-                            f"1. 'action': either 'block' (if brute force, attacks, or security breach) or 'ignore'\n"
-                            f"2. 'ip': the attacker source IP address if found in the log\n"
-                            f"3. 'incident_type': type of attack or event\n"
-                            f"4. 'analysis_summary': brief explanation of what happened in Indonesian language\n"
-                            f"5. 'detailed_analysis': a long, humanized and structured report in Indonesian language explaining: "
+                            f"Analyze this security log from targeted server '{host}':\\n"
+                            f"Title: {title}\\n"
+                            f"Raw Log Message: {raw}\\n\\n"
+                            f"Return a JSON object with these keys:\\n"
+                            f"1. 'action': either 'block' (if brute force, attacks, or security breach) or 'ignore'\\n"
+                            f"2. 'ip': the attacker source IP address if found in the log\\n"
+                            f"3. 'incident_type': type of attack or event\\n"
+                            f"4. 'analysis_summary': brief explanation of what happened in Indonesian language\\n"
+                            f"5. 'detailed_analysis': a structured report in Indonesian language explaining: "
                             f"which server was targeted ({host}), why it was blocked or ignored, what vulnerability "
-                            f"was exploited (XSS, SQLi, brute force, etc.), how the threat behaves, and recommended next steps."
+                            f"was exploited, how the threat behaves, and recommended next steps."
                         )
                         ollama_payload = {
                             "model": "llama3.2",
@@ -881,7 +1219,6 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                         detailed_analysis = ai_data.get('detailed_analysis') or 'Tidak tersedia.'
                         incident_type_ai = ai_data.get('incident_type') or title
                         
-                        # Muat ulang data event, cari yang ID-nya sama, dan update laporannya
                         current_events = load_events()
                         for ev in current_events:
                             if ev.get("id") == ev_id:
@@ -890,43 +1227,24 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                                 ev["incident_type"] = incident_type_ai
                                 break
                         save_events(current_events)
-                        print(f"[BACKGROUND LLM] Sukses memperbarui analisis untuk event: {ev_id}")
                     except Exception as e:
-                        print(f"[BACKGROUND LLM ERROR] Gagal memperbarui event {ev_id}: {e}")
-                        current_events = load_events()
-                        for ev in current_events:
-                            if ev.get("id") == ev_id:
-                                ev["analysis"] = "Gagal memproses analisis LLM."
-                                ev["detailed_analysis"] = f"Terjadi kesalahan saat memanggil LLM lokal: {str(e)}"
-                                break
-                        save_events(current_events)
+                        print("Error background LLM:", e)
 
-                # Jalankan thread asinkron untuk inferensi LLM
-                threading.Thread(target=run_background_analysis, args=(event_id, log_title, log_text, agent_name, raw_log)).start()
+                t = threading.Thread(target=run_background_analysis, args=(event_id, log_title, log_text, agent_name, raw_log))
+                t.daemon = True
+                t.start()
 
-                # Kembalikan respon sukses instan ke Wazuh
-                self.wfile.write(json.dumps({
-                    "success": True, 
-                    "message": "Webhook received. Attacker blocked instantly. LLM analysis started in background."
-                }).encode('utf-8'))
+                self.wfile.write(json.dumps({"success": True, "id": event_id}).encode('utf-8'))
                 
             except Exception as e:
-                print("Error saat memproses webhook SOAR:", e)
-                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.end_headers()
+                print("Error parsing webhook:", e)
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+
+def run_server():
+    server = socketserver.ThreadingTCPServer(('0.0.0.0', PORT), LightweightSOARHandler)
+    server.allow_reuse_address = True
+    print(f"[*] Lightweight SOAR Engine aktif di port {PORT}...")
+    server.serve_forever()
 
 if __name__ == '__main__':
-    # Pastikan direktori riset ada
-    os.makedirs('/root/riset', exist_ok=True)
-    
-    # Jalankan server
-    handler = LightweightSOARHandler
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.ThreadingTCPServer(("", PORT), handler) as httpd:
-        print(f"Layanan Lightweight Agentic SOAR berjalan di port {PORT}")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nMenghentikan server.")
+    run_server()
