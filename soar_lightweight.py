@@ -8,12 +8,18 @@ import os
 import subprocess
 import re
 import threading
+import secrets
+from http import cookies
 
 PORT = 8080
 EVENTS_FILE = '/root/riset/soar_events.json'
 ASSETS_FILE = '/root/riset/protected_assets.json'
+SESSIONS_FILE = '/root/riset/soar_sessions.json'
 OLLAMA_URL = 'http://10.88.0.4:11434/api/generate'
 DEFAULT_TTL = 86400  # 24 Jam (dalam detik)
+
+ADMIN_USER = 'admin'
+ADMIN_PASS = 'M@ngapsjunk9290'
 
 db_lock = threading.Lock()
 
@@ -52,6 +58,44 @@ def save_assets(assets):
                 json.dump(assets, f, indent=2)
         except Exception as e:
             print("Gagal menyimpan aset ke file:", e)
+
+def load_sessions():
+    with db_lock:
+        if os.path.exists(SESSIONS_FILE):
+            try:
+                with open(SESSIONS_FILE, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+def save_sessions(sessions):
+    with db_lock:
+        try:
+            with open(SESSIONS_FILE, 'w') as f:
+                json.dump(sessions, f, indent=2)
+        except Exception as e:
+            print("Gagal menyimpan sesi ke file:", e)
+
+def is_authenticated(headers):
+    cookie_str = headers.get('Cookie')
+    if not cookie_str:
+        return False
+    try:
+        c = cookies.SimpleCookie(cookie_str)
+        if 'soar_session' not in c:
+            return False
+        token = c['soar_session'].value
+        sessions = load_sessions()
+        if token in sessions:
+            expires_str = sessions[token].get('expires')
+            if expires_str:
+                expires = datetime.datetime.fromisoformat(expires_str)
+                if datetime.datetime.now() < expires:
+                    return True
+        return False
+    except Exception:
+        return False
 
 def get_asset_by_host_or_ip(host_or_ip):
     if not host_or_ip:
@@ -154,6 +198,99 @@ def get_active_blocked_ips():
     return blocked_list
 
 
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - Lightweight Cognitive SOAR</title>
+    <link rel="icon" type="image/jpeg" href="/soar_logo.jpg">
+    <link rel="shortcut icon" href="/favicon.ico">
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 font-sans min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl p-8 backdrop-blur-sm">
+        <div class="text-center mb-8">
+            <img src="/soar_logo.jpg" alt="UIN SOAR Logo" class="w-20 h-20 mx-auto rounded-2xl shadow-xl shadow-cyan-500/25 border-2 border-cyan-500/30 object-cover mb-4">
+            <h1 class="text-2xl font-extrabold text-white tracking-tight">UIN Jakarta SOAR</h1>
+            <p class="text-gray-400 text-xs mt-1.5 font-medium">Security Operations Center - Portal Autentikasi</p>
+        </div>
+
+        <div id="loginAlert" class="hidden mb-6 p-3 bg-red-950/60 border border-red-800 text-red-300 text-xs rounded-xl flex items-center">
+            <span class="mr-2 text-base">⚠️</span>
+            <span id="alertMsg">Username atau password tidak valid!</span>
+        </div>
+
+        <form id="loginForm" onsubmit="handleLogin(event)" class="space-y-5 text-sm">
+            <div>
+                <label class="block text-gray-400 text-xs font-semibold uppercase tracking-wider mb-2">Username Administrator</label>
+                <div class="relative">
+                    <input type="text" id="username" required placeholder="Masukkan username" class="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition-colors">
+                </div>
+            </div>
+
+            <div>
+                <label class="block text-gray-400 text-xs font-semibold uppercase tracking-wider mb-2">Password Akses</label>
+                <div class="relative">
+                    <input type="password" id="password" required placeholder="••••••••••••" class="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition-colors">
+                </div>
+            </div>
+
+            <button type="submit" id="submitBtn" class="w-full py-3 px-4 bg-gradient-to-r from-indigo-600 to-cyan-600 hover:from-indigo-500 hover:to-cyan-500 text-white font-semibold rounded-xl shadow-lg shadow-indigo-500/25 transition-all duration-150 transform active:scale-95 flex items-center justify-center">
+                <span>Masuk ke Konsol SOC</span>
+                <span class="ml-2">🔐</span>
+            </button>
+        </form>
+
+        <div class="mt-8 pt-6 border-t border-gray-700/60 text-center">
+            <p class="text-xs text-gray-500 flex items-center justify-center">
+                <span class="w-2 h-2 bg-green-500 rounded-full inline-block mr-2 animate-pulse"></span>
+                Sistem Terproteksi Dual-Tier Kernel Edge Firewall
+            </p>
+        </div>
+    </div>
+
+    <script>
+        function handleLogin(e) {
+            e.preventDefault();
+            const u = document.getElementById('username').value.trim();
+            const p = document.getElementById('password').value.trim();
+            const btn = document.getElementById('submitBtn');
+            const alertBox = document.getElementById('loginAlert');
+            const alertMsg = document.getElementById('alertMsg');
+
+            btn.disabled = true;
+            btn.innerHTML = '<span class="animate-spin mr-2">⏳</span> Memverifikasi...';
+
+            fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: u, password: p })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    window.location.href = '/';
+                } else {
+                    alertBox.classList.remove('hidden');
+                    alertMsg.innerText = data.error || 'Username atau password salah!';
+                    btn.disabled = false;
+                    btn.innerHTML = '<span>Masuk ke Konsol SOC</span><span class="ml-2">🔐</span>';
+                }
+            })
+            .catch(err => {
+                alertBox.classList.remove('hidden');
+                alertMsg.innerText = 'Koneksi gagal: ' + err;
+                btn.disabled = false;
+                btn.innerHTML = '<span>Masuk ke Konsol SOC</span><span class="ml-2">🔐</span>';
+            });
+        }
+    </script>
+</body>
+</html>
+"""
+
+
 class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
 
     def do_HEAD(self):
@@ -168,31 +305,8 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_GET(self):
-        if self.path == '/api/events':
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            events = load_events()
-            self.wfile.write(json.dumps(events).encode('utf-8'))
-            return
-
-        elif self.path == '/api/assets':
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            assets = load_assets()
-            self.wfile.write(json.dumps(assets).encode('utf-8'))
-            return
-
-        elif self.path == '/api/blocked':
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            blocked_ips = get_active_blocked_ips()
-            self.wfile.write(json.dumps(blocked_ips).encode('utf-8'))
-            return
-
-        elif self.path in ['/favicon.ico', '/favicon.png', '/soar_logo.jpg']:
+        # 1. Aset Publik Statis (Favicon & Logo)
+        if self.path in ['/favicon.ico', '/favicon.png', '/soar_logo.jpg']:
             logo_path = '/root/riset/soar_logo.jpg'
             if os.path.exists(logo_path):
                 self.send_response(200)
@@ -207,7 +321,91 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
+        # 2. Halaman Login
+        elif self.path == '/login':
+            if is_authenticated(self.headers):
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(LOGIN_HTML.encode('utf-8'))
+            return
+
+        # 3. Logout Endpoint
+        elif self.path == '/logout':
+            cookie_str = self.headers.get('Cookie')
+            if cookie_str:
+                try:
+                    c = cookies.SimpleCookie(cookie_str)
+                    if 'soar_session' in c:
+                        token = c['soar_session'].value
+                        sessions = load_sessions()
+                        if token in sessions:
+                            del sessions[token]
+                            save_sessions(sessions)
+                except Exception:
+                    pass
+
+            self.send_response(302)
+            self.send_header('Set-Cookie', 'soar_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax')
+            self.send_header('Location', '/login')
+            self.end_headers()
+            return
+
+        # 4. API Endpoints (Memerlukan Autentikasi)
+        elif self.path == '/api/events':
+            if not is_authenticated(self.headers):
+                self.send_response(401)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Unauthorized"}).encode('utf-8'))
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            events = load_events()
+            self.wfile.write(json.dumps(events).encode('utf-8'))
+            return
+
+        elif self.path == '/api/assets':
+            if not is_authenticated(self.headers):
+                self.send_response(401)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Unauthorized"}).encode('utf-8'))
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            assets = load_assets()
+            self.wfile.write(json.dumps(assets).encode('utf-8'))
+            return
+
+        elif self.path == '/api/blocked':
+            if not is_authenticated(self.headers):
+                self.send_response(401)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Unauthorized"}).encode('utf-8'))
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            blocked_ips = get_active_blocked_ips()
+            self.wfile.write(json.dumps(blocked_ips).encode('utf-8'))
+            return
+
+        # 5. Halaman Utama Dasbor (Memerlukan Autentikasi)
         elif self.path == '/' or self.path == '/index.html':
+            if not is_authenticated(self.headers):
+                self.send_response(302)
+                self.send_header('Location', '/login')
+                self.end_headers()
+                return
+
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
@@ -239,6 +437,12 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 <div class="flex items-center bg-gray-800 border border-gray-700 px-4 py-2 rounded-lg text-sm text-cyan-400 font-mono shadow-inner">
                     <span class="w-3 h-3 bg-green-500 rounded-full inline-block mr-2.5 animate-pulse"></span>
                     Dual-Tier Edge Defense (O(1))
+                </div>
+                <!-- User Profile & Logout -->
+                <div class="flex items-center space-x-2 bg-gray-800 border border-gray-700 px-3 py-1.5 rounded-lg text-xs text-gray-300">
+                    <span class="font-semibold text-indigo-400">👤 admin</span>
+                    <span class="text-gray-600">|</span>
+                    <a href="/logout" class="text-red-400 hover:text-red-300 font-semibold transition-colors">Keluar</a>
                 </div>
             </div>
         </div>
@@ -596,7 +800,10 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
 
         function fetchEventsFromDB() {
             fetch('/api/events')
-                .then(res => res.json())
+                .then(res => {
+                    if (res.status === 401) { window.location.href = '/login'; return []; }
+                    return res.json();
+                })
                 .then(data => {
                     eventsData = data;
                     document.getElementById('badgeEventCount').innerText = eventsData.length;
@@ -609,7 +816,10 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
 
         function fetchAssetsFromDB() {
             fetch('/api/assets')
-                .then(res => res.json())
+                .then(res => {
+                    if (res.status === 401) { window.location.href = '/login'; return []; }
+                    return res.json();
+                })
                 .then(data => {
                     assetsData = data;
                     document.getElementById('statAssets').innerText = assetsData.length;
@@ -621,7 +831,10 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
 
         function fetchBlockedFromDB() {
             fetch('/api/blocked')
-                .then(res => res.json())
+                .then(res => {
+                    if (res.status === 401) { window.location.href = '/login'; return []; }
+                    return res.json();
+                })
                 .then(data => {
                     blockedData = data;
                     document.getElementById('statBlockedActive').innerText = blockedData.length;
@@ -774,7 +987,6 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
         }
 
         function renderAllCharts() {
-            // Hitung data agregat
             const threatCounts = {};
             const targetCounts = {};
             const timelineCounts = {};
@@ -997,9 +1209,51 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    # 2. HANDLE POST (WEBHOOK DARI WAZUH/TRACECAT, UNBLOCK, & ASSET REGISTRATION)
+    # 2. HANDLE POST (LOGIN, WEBHOOK, UNBLOCK, ASSET REGISTRATION)
     def do_POST(self):
-        if self.path == '/api/unblock':
+        # A. Login Authentication Endpoint
+        if self.path == '/api/login':
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            try:
+                creds = json.loads(post_data)
+                u = creds.get('username', '').strip()
+                p = creds.get('password', '').strip()
+                if u == ADMIN_USER and p == ADMIN_PASS:
+                    token = secrets.token_hex(24)
+                    expires = (datetime.datetime.now() + datetime.timedelta(days=7)).isoformat()
+                    sessions = load_sessions()
+                    sessions[token] = {"user": ADMIN_USER, "expires": expires}
+                    save_sessions(sessions)
+
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Set-Cookie', f'soar_session={token}; Path=/; Max-Age=604800; HttpOnly; SameSite=Lax')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+                    return
+                else:
+                    self.send_response(401)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "Username atau password tidak valid!"}).encode('utf-8'))
+                    return
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+                return
+
+        # B. Unblock Endpoint (Memerlukan Autentikasi)
+        elif self.path == '/api/unblock':
+            if not is_authenticated(self.headers):
+                self.send_response(401)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Unauthorized"}).encode('utf-8'))
+                return
+
             content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length).decode('utf-8')
             try:
@@ -1025,7 +1279,15 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
                 return
 
+        # C. Registrasi Aset Baru (Memerlukan Autentikasi)
         elif self.path == '/api/assets':
+            if not is_authenticated(self.headers):
+                self.send_response(401)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Unauthorized"}).encode('utf-8'))
+                return
+
             content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length).decode('utf-8')
             try:
@@ -1062,6 +1324,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
                 return
 
+        # D. Webhook Ingestion (Terbuka untuk integrasi Wazuh SIEM)
         elif self.path == '/webhook':
             content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length).decode('utf-8')
@@ -1240,9 +1503,11 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 print("Error parsing webhook:", e)
                 self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
 
+class ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
 def run_server():
-    server = socketserver.ThreadingTCPServer(('0.0.0.0', PORT), LightweightSOARHandler)
-    server.allow_reuse_address = True
+    server = ReusableThreadingTCPServer(('0.0.0.0', PORT), LightweightSOARHandler)
     print(f"[*] Lightweight SOAR Engine aktif di port {PORT}...")
     server.serve_forever()
 

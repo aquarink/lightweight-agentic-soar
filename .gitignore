@@ -1,5 +1,6 @@
 # Ignore dynamic database
 soar_events.json
+soar_sessions.json
 
 # Ignore logs
 *.log
