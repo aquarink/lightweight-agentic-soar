@@ -343,7 +343,27 @@ def run_background_analysis(ev_id, title, text, host, raw):
         
         ai_data = json.loads(ai_raw_response)
         analysis_summary = ai_data.get('analysis_summary') or ai_data.get('analysis') or ai_data.get('summary') or 'Analisis tidak tersedia.'
-        detailed_analysis = ai_data.get('detailed_analysis') or 'Tidak tersedia.'
+        detailed_analysis_raw = ai_data.get('detailed_analysis') or 'Tidak tersedia.'
+        
+        if isinstance(detailed_analysis_raw, dict):
+            lines = []
+            labels = {
+                "server_targeted": "Target Server",
+                "reason_blocked": "Alasan Blokir",
+                "exploited_vulnerability": "Kerentanan yang Dieksploitasi",
+                "threat_behaviour": "Perilaku Ancaman",
+                "recommended_next_steps": "Rekomendasi Tindakan & Mitigasi"
+            }
+            for k, v in detailed_analysis_raw.items():
+                label = labels.get(k, k.replace('_', ' ').title())
+                val = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+                lines.append(f"• {label}:\n  {val}")
+            detailed_analysis = "\n\n".join(lines)
+        elif isinstance(detailed_analysis_raw, list):
+            detailed_analysis = "\n".join(f"• {item}" for item in detailed_analysis_raw)
+        else:
+            detailed_analysis = str(detailed_analysis_raw)
+
         incident_type_ai = ai_data.get('incident_type') or title
         
         current_events = load_events()
@@ -1188,7 +1208,21 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             document.getElementById('modalTargetService').innerText = ev.target_service || (matched ? matched.services : 'Layanan Kampus Terpantau');
 
             document.getElementById('modalAnalysis').innerText = ev.analysis || 'Analisis tidak tersedia.';
-            document.getElementById('modalDetailedAnalysis').innerText = ev.detailed_analysis || 'Tidak ada laporan kognitif mendalam tambahan untuk kejadian lama ini.';
+            
+            let detailText = ev.detailed_analysis;
+            if (typeof detailText === 'object' && detailText !== null) {
+                const labels = {
+                    server_targeted: "Target Server",
+                    reason_blocked: "Alasan Blokir",
+                    exploited_vulnerability: "Kerentanan yang Dieksploitasi",
+                    threat_behaviour: "Perilaku Ancaman",
+                    recommended_next_steps: "Rekomendasi Tindakan & Mitigasi"
+                };
+                detailText = Object.entries(detailText)
+                    .map(([k, v]) => `• ${labels[k] || k.replace(/_/g, ' ').toUpperCase()}:\n  ${typeof v === 'object' ? JSON.stringify(v) : v}`)
+                    .join('\n\n');
+            }
+            document.getElementById('modalDetailedAnalysis').innerText = detailText || 'Tidak ada laporan kognitif mendalam tambahan untuk kejadian lama ini.';
             
             const badge = document.getElementById('modalActionBadge');
             badge.innerText = (ev.action || 'ignore').toUpperCase();
