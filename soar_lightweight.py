@@ -291,6 +291,54 @@ LOGIN_HTML = """<!DOCTYPE html>
 """
 
 
+def run_background_analysis(ev_id, title, text, host, raw):
+    try:
+        prompt = (
+            f"Analyze this security log from targeted server '{host}':\n"
+            f"Title: {title}\n"
+            f"Raw Log Message: {raw}\n\n"
+            f"Return a JSON object with these keys:\n"
+            f"1. 'action': either 'block' (if brute force, attacks, or security breach) or 'ignore'\n"
+            f"2. 'ip': the attacker source IP address if found in the log\n"
+            f"3. 'incident_type': type of attack or event\n"
+            f"4. 'analysis_summary': brief explanation of what happened in Indonesian language\n"
+            f"5. 'detailed_analysis': a structured report in Indonesian language explaining: "
+            f"which server was targeted ({host}), why it was blocked or ignored, what vulnerability "
+            f"was exploited, how the threat behaves, and recommended next steps."
+        )
+        ollama_payload = {
+            "model": "llama3.2",
+            "prompt": prompt,
+            "format": "json",
+            "stream": False
+        }
+        req = urllib.request.Request(
+            OLLAMA_URL, 
+            data=json.dumps(ollama_payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
+        with urllib.request.urlopen(req, timeout=60) as response:
+            res_body = response.read().decode('utf-8')
+            res_json = json.loads(res_body)
+            ai_raw_response = res_json.get('response', '').strip()
+        
+        ai_data = json.loads(ai_raw_response)
+        analysis_summary = ai_data.get('analysis_summary') or ai_data.get('analysis') or ai_data.get('summary') or 'Analisis tidak tersedia.'
+        detailed_analysis = ai_data.get('detailed_analysis') or 'Tidak tersedia.'
+        incident_type_ai = ai_data.get('incident_type') or title
+        
+        current_events = load_events()
+        for ev in current_events:
+            if ev.get("id") == ev_id:
+                ev["analysis"] = analysis_summary
+                ev["detailed_analysis"] = detailed_analysis
+                ev["incident_type"] = incident_type_ai
+                break
+        save_events(current_events)
+    except Exception as e:
+        print("Error background LLM:", e)
+
+
 class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
 
     def do_HEAD(self):
@@ -1336,6 +1384,67 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             try:
                 log_data = json.loads(post_data)
                 
+                # 1. ArusBalik Embedded WAF Format
+                if log_data.get("source") == "arusbalik_waf" or "rule_id" in log_data:
+                    attacker_ip = str(log_data.get('attacker_ip') or log_data.get('ip') or '').strip()
+                    target_host = str(log_data.get('target_host') or 'Web Application').strip()
+                    rule_id = log_data.get('rule_id', 0)
+                    uri = str(log_data.get('uri') or '/')
+                    method = str(log_data.get('method') or 'GET')
+                    incident_name = str(log_data.get('incident_type') or 'Web Application Attack')
+                    incident_type = f"WAF Block: {incident_name} (Rule {rule_id})"
+                    raw_log = f"ArusBalik WAF Blocked | Rule: {rule_id} | Host: {target_host} | Method: {method} | URI: {uri} | Attacker IP: {attacker_ip}"
+
+                    matched_asset = get_asset_by_host_or_ip(target_host)
+                    target_display = f"{target_host} ({matched_asset['wg_ip']})" if matched_asset else target_host
+
+                    action = "block"
+                    mitigation_status = "Diblokir oleh ArusBalik Embedded WAF (HTTP 403)"
+                    is_valid_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip))
+                    is_whitelisted = (
+                        attacker_ip.startswith("10.88.0.") or 
+                        attacker_ip.startswith("127.") or 
+                        attacker_ip.startswith("172.20.") or
+                        attacker_ip == "38.47.180.2"
+                    )
+
+                    if attacker_ip and is_valid_ip and not is_whitelisted:
+                        block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL)
+                        mitigation_status = f"Diblokir oleh ArusBalik WAF (403) & O(1) ipset drop ({attacker_ip})"
+
+                    event_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
+                    events = load_events()
+                    new_event = {
+                        "id": event_id,
+                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "incident_type": incident_type,
+                        "target_host": target_host,
+                        "target_host_display": target_display,
+                        "target_ip": matched_asset.get('wg_ip') if matched_asset else 'N/A',
+                        "target_lan": matched_asset.get('lan_ip') if matched_asset else 'N/A',
+                        "target_service": matched_asset.get('services') if matched_asset else 'N/A',
+                        "raw_log": raw_log,
+                        "ip": attacker_ip if attacker_ip else "N/A",
+                        "analysis": f"Permintaan berbahaya ke {target_host}{uri} diblokir langsung oleh ArusBalik In-Process WAF (Rule {rule_id}).",
+                        "detailed_analysis": "Ollama Llama 3.2 sedang merumuskan analisis kognitif di latar belakang secara asinkron...",
+                        "action": action,
+                        "mitigation": mitigation_status
+                    }
+                    events.append(new_event)
+                    if len(events) > 50:
+                        events = events[-50:]
+                    save_events(events)
+
+                    t = threading.Thread(
+                        target=run_background_analysis,
+                        args=(event_id, incident_type, f"WAF rule {rule_id} triggered on {uri} by {attacker_ip}", target_host, raw_log)
+                    )
+                    t.daemon = True
+                    t.start()
+
+                    self.wfile.write(json.dumps({"success": True, "id": event_id, "event": new_event}).encode('utf-8'))
+                    return
+
                 # Tracecat format
                 if "analysis_summary" in log_data:
                     action = log_data.get('action', 'ignore').lower()
@@ -1445,53 +1554,6 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 if len(events) > 50:
                     events = events[-50:]
                 save_events(events)
-
-                def run_background_analysis(ev_id, title, text, host, raw):
-                    try:
-                        prompt = (
-                            f"Analyze this security log from targeted server '{host}':\\n"
-                            f"Title: {title}\\n"
-                            f"Raw Log Message: {raw}\\n\\n"
-                            f"Return a JSON object with these keys:\\n"
-                            f"1. 'action': either 'block' (if brute force, attacks, or security breach) or 'ignore'\\n"
-                            f"2. 'ip': the attacker source IP address if found in the log\\n"
-                            f"3. 'incident_type': type of attack or event\\n"
-                            f"4. 'analysis_summary': brief explanation of what happened in Indonesian language\\n"
-                            f"5. 'detailed_analysis': a structured report in Indonesian language explaining: "
-                            f"which server was targeted ({host}), why it was blocked or ignored, what vulnerability "
-                            f"was exploited, how the threat behaves, and recommended next steps."
-                        )
-                        ollama_payload = {
-                            "model": "llama3.2",
-                            "prompt": prompt,
-                            "format": "json",
-                            "stream": False
-                        }
-                        req = urllib.request.Request(
-                            OLLAMA_URL, 
-                            data=json.dumps(ollama_payload).encode('utf-8'),
-                            headers={'Content-Type': 'application/json'}
-                        )
-                        with urllib.request.urlopen(req, timeout=60) as response:
-                            res_body = response.read().decode('utf-8')
-                            res_json = json.loads(res_body)
-                            ai_raw_response = res_json.get('response', '').strip()
-                        
-                        ai_data = json.loads(ai_raw_response)
-                        analysis_summary = ai_data.get('analysis_summary') or ai_data.get('analysis') or ai_data.get('summary') or 'Analisis tidak tersedia.'
-                        detailed_analysis = ai_data.get('detailed_analysis') or 'Tidak tersedia.'
-                        incident_type_ai = ai_data.get('incident_type') or title
-                        
-                        current_events = load_events()
-                        for ev in current_events:
-                            if ev.get("id") == ev_id:
-                                ev["analysis"] = analysis_summary
-                                ev["detailed_analysis"] = detailed_analysis
-                                ev["incident_type"] = incident_type_ai
-                                break
-                        save_events(current_events)
-                    except Exception as e:
-                        print("Error background LLM:", e)
 
                 t = threading.Thread(target=run_background_analysis, args=(event_id, log_title, log_text, agent_name, raw_log))
                 t.daemon = True
