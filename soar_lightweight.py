@@ -1264,8 +1264,8 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     recommended_next_steps: "Rekomendasi Tindakan & Mitigasi"
                 };
                 detailText = Object.entries(detailText)
-                    .map(([k, v]) => `• ${labels[k] || k.replace(/_/g, ' ').toUpperCase()}:\n  ${typeof v === 'object' ? JSON.stringify(v) : v}`)
-                    .join('\n\n');
+                    .map(([k, v]) => `• ${labels[k] || k.replace(/_/g, ' ').toUpperCase()}: ` + (typeof v === 'object' ? JSON.stringify(v) : v))
+                    .join(String.fromCharCode(10, 10));
             }
             document.getElementById('modalDetailedAnalysis').innerText = detailText || 'Tidak ada laporan kognitif mendalam tambahan untuk kejadian lama ini.';
             
