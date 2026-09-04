@@ -38,6 +38,7 @@ AI_MODEL = os.getenv('SOAR_AI_MODEL', 'qwen2.5-coder:1.5b')
 DEFAULT_TTL = int(os.getenv('DEFAULT_TTL', 86400))
 
 ADMIN_USER = os.getenv('SOAR_ADMIN_USER', 'admin')
+ADMIN_PASS = os.getenv('SOAR_ADMIN_PASS', 'admin123')
 EXTRA_WHITELIST_IPS = set(ip.strip() for ip in os.getenv('SOAR_WHITELISTED_IPS', '').split(',') if ip.strip())
 ARUSBALIK_SSH_HOST = os.getenv('ARUSBALIK_SSH_HOST', '10.88.0.1')
 ARUSBALIK_SSH_USER = os.getenv('ARUSBALIK_SSH_USER', 'root')
