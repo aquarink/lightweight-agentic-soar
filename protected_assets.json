@@ -50,7 +50,7 @@
     "name": "VM (105) - SIEM Wazuh & Grafana",
     "wg_ip": "10.88.0.12",
     "lan_ip": "172.20.32.25",
-    "services": "Wazuh Manager (1514), Indexer (9200), Dashboard (443), Grafana (3000)",
+    "services": "wazuh.uinjakarta.id, grafana.uinjakarta.id, Manager (1514), Indexer (9200)",
     "status": "protected"
   },
   {
