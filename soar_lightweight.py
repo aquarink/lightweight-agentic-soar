@@ -131,7 +131,25 @@ def get_asset_by_host_or_ip(host_or_ip):
             a.get('wg_ip', '') == needle or
             a.get('id', '') == needle):
             return a
-    return None
+waf_offense_tracker = {}
+waf_tracker_lock = threading.Lock()
+
+def record_and_check_waf_threshold(attacker_ip, rule_id, threshold=3, window_sec=300):
+    """Mencegah pemblokiran firewall agresif (false positive) untuk pelanggaran WAF level aplikasi tunggal."""
+    # Serangan bot scanner eksplisit (10001), traversal (10002), atau RCE (10007) langsung diblokir
+    if rule_id in (10001, 10002, 10007):
+        return True, 1, 1
+    
+    import time
+    now = time.time()
+    with waf_tracker_lock:
+        if attacker_ip not in waf_offense_tracker:
+            waf_offense_tracker[attacker_ip] = []
+        waf_offense_tracker[attacker_ip] = [t for t in waf_offense_tracker[attacker_ip] if now - t <= window_sec]
+        waf_offense_tracker[attacker_ip].append(now)
+        count = len(waf_offense_tracker[attacker_ip])
+        should_block = count >= threshold
+        return should_block, count, threshold
 
 # --- FIREWALL MITIGATION ENGINE (DUAL-TIER O(1) IPSET: HOST + EDGE ARUSBALIK) ---
 def block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL):
@@ -1507,8 +1525,13 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     )
 
                     if attacker_ip and is_valid_ip and not is_whitelisted:
-                        block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL)
-                        mitigation_status = f"Diblokir oleh ArusBalik WAF (403) & O(1) ipset drop ({attacker_ip})"
+                        should_ban, count, threshold = record_and_check_waf_threshold(attacker_ip, rule_id, threshold=3, window_sec=300)
+                        if should_ban:
+                            ban_ttl = int(os.getenv('WAF_BAN_TTL', 3600))
+                            block_ip_everywhere(attacker_ip, ttl=ban_ttl)
+                            mitigation_status = f"Eskalasi Firewall: IP {attacker_ip} diblokir O(1) ipset ({count}/{threshold} pelanggaran WAF)"
+                        else:
+                            mitigation_status = f"Diblokir oleh ArusBalik WAF (403) - Ambang Batas Aman ({count}/{threshold})"
 
                     event_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
                     events = load_events()
