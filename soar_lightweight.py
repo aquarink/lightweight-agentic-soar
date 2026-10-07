@@ -36,6 +36,8 @@ SESSIONS_FILE = os.getenv('SOAR_SESSIONS_FILE', os.path.join(os.path.dirname(os.
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434/api/generate')
 AI_MODEL = os.getenv('SOAR_AI_MODEL', 'qwen2.5-coder:1.5b')
 DEFAULT_TTL = int(os.getenv('DEFAULT_TTL', 86400))
+SOAR_RETENTION_DAYS = int(os.getenv('SOAR_RETENTION_DAYS', 30))
+SOAR_MAX_EVENTS = int(os.getenv('SOAR_MAX_EVENTS', 5000))
 
 ADMIN_USER = os.getenv('SOAR_ADMIN_USER', 'admin')
 ADMIN_PASS = os.getenv('SOAR_ADMIN_PASS', 'admin123')
@@ -43,6 +45,72 @@ EXTRA_WHITELIST_IPS = set(ip.strip() for ip in os.getenv('SOAR_WHITELISTED_IPS',
 ARUSBALIK_SSH_HOST = os.getenv('ARUSBALIK_SSH_HOST', '10.88.0.1')
 ARUSBALIK_SSH_USER = os.getenv('ARUSBALIK_SSH_USER', 'root')
 ARUSBALIK_SSH_PASS = os.getenv('ARUSBALIK_SSH_PASS', '')
+
+def prune_events(events, retention_days=None, max_events=None):
+    """Menyaring event agar sesuai durasi retensi (hari) dan kapasitas maksimum."""
+    if retention_days is None:
+        retention_days = SOAR_RETENTION_DAYS
+    if max_events is None:
+        max_events = SOAR_MAX_EVENTS
+
+    if retention_days > 0:
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=retention_days)
+        filtered = []
+        for ev in events:
+            ts_str = ev.get('timestamp')
+            if ts_str:
+                try:
+                    clean_ts = str(ts_str).strip().split('.')[0]
+                    ev_dt = datetime.datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
+                    if ev_dt < cutoff:
+                        continue
+                except Exception:
+                    pass
+            filtered.append(ev)
+        events = filtered
+
+    if max_events > 0 and len(events) > max_events:
+        events = events[-max_events:]
+    return events
+
+def extract_log_timestamp(log_data, raw_log=""):
+    """Mengekstrak timestamp asli dari log Wazuh/WAF jika tersedia, fallback ke datetime.now()."""
+    ts = log_data.get('timestamp') or log_data.get('time')
+    if ts and isinstance(ts, str):
+        try:
+            clean_ts = ts.replace('Z', '+00:00')
+            clean_ts = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', clean_ts)
+            dt = datetime.datetime.fromisoformat(clean_ts)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+
+    pre_ts = log_data.get('predecoder', {}).get('timestamp')
+    if pre_ts and isinstance(pre_ts, str):
+        try:
+            curr_year = datetime.datetime.now().year
+            dt = datetime.datetime.strptime(f"{curr_year} {pre_ts}", "%Y %b %d %H:%M:%S")
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def is_whitelisted_ip(ip):
+    """Mengecek apakah IP berada dalam subnet terlindungi / internal kampus / lab riset."""
+    if not ip or ip in ('0.0.0.0', '255.255.255.255'):
+        return True
+    clean_ip = str(ip).strip()
+    if (
+        clean_ip.startswith("127.") or
+        clean_ip.startswith("10.88.") or
+        clean_ip.startswith("10.10.10.") or
+        clean_ip.startswith("10.99.0.") or
+        clean_ip.startswith("172.20.") or
+        clean_ip in EXTRA_WHITELIST_IPS
+    ):
+        return True
+    return False
 
 db_lock = threading.Lock()
 
@@ -153,9 +221,10 @@ def record_and_check_waf_threshold(attacker_ip, rule_id, threshold=3, window_sec
 
 # --- FIREWALL MITIGATION ENGINE (DUAL-TIER O(1) IPSET: HOST + EDGE ARUSBALIK) ---
 def block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL):
-    if not attacker_ip or attacker_ip in ('0.0.0.0', '255.255.255.255') or not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip):
+    if not attacker_ip or not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip):
         return False
-    if attacker_ip.startswith("127.") or attacker_ip in EXTRA_WHITELIST_IPS:
+    if is_whitelisted_ip(attacker_ip):
+        print(f"[SOAR] Mitigasi dibatalkan: IP {attacker_ip} berada dalam daftar putih (lab/internal/whitelisted).")
         return False
     
     # 1. Proxmox Host ipset (O(1) Kernel Hash Table)
@@ -644,9 +713,14 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                         <h2 class="text-lg font-semibold text-white">Log Aktivitas Triase Kognitif Real-Time</h2>
                         <p class="text-xs text-indigo-400 mt-0.5">💡 Klik pada baris tabel untuk melihat rincian laporan mendalam AI, fakta log, & status mitigasi</p>
                     </div>
-                    <div class="flex items-center space-x-2">
-                        <span class="w-2 h-2 bg-indigo-500 rounded-full animate-ping"></span>
-                        <span class="text-xs text-gray-400">Pembaruan otomatis aktif</span>
+                    <div class="flex items-center space-x-3">
+                        <div class="flex items-center space-x-2">
+                            <span class="w-2 h-2 bg-indigo-500 rounded-full animate-ping"></span>
+                            <span class="text-xs text-gray-400">Pembaruan otomatis</span>
+                        </div>
+                        <button onclick="openManageLogsModal()" class="px-3 py-1.5 bg-gray-750 hover:bg-gray-700 text-gray-200 border border-gray-600/70 rounded-lg text-xs font-semibold flex items-center transition-all shadow-sm">
+                            <span class="mr-1.5">🧹</span> Kelola Riwayat
+                        </button>
                     </div>
                 </div>
                 <div class="overflow-x-auto">
@@ -866,8 +940,43 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 </div>
             </div>
             <!-- Modal Footer -->
-            <div class="px-6 py-4 border-t border-gray-700 bg-gray-900/50 flex justify-end">
+            <div class="px-6 py-4 border-t border-gray-700 bg-gray-900/50 flex justify-between items-center">
+                <button onclick="deleteCurrentEvent()" class="px-4 py-2 bg-red-950/60 hover:bg-red-900 text-red-300 border border-red-800/60 rounded-lg text-xs md:text-sm font-semibold transition-colors duration-150 flex items-center">
+                    <span class="mr-1.5">🗑️</span> Hapus Insiden Ini
+                </button>
                 <button onclick="closeModal()" class="px-5 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm font-medium transition-colors duration-150">Tutup Laporan</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL KELOLA / BERSIHKAN RIWAYAT LOG -->
+    <div id="manageLogsModal" class="fixed inset-0 z-50 hidden bg-black/80 flex items-center justify-center p-4 backdrop-blur-sm">
+        <div class="bg-gray-800 border border-gray-700 rounded-2xl max-w-md w-full overflow-hidden shadow-2xl p-6">
+            <div class="flex justify-between items-center pb-3 border-b border-gray-700 mb-4">
+                <h3 class="text-lg font-bold text-white flex items-center">
+                    <span class="mr-2">🧹</span> Pengelolaan & Retensi Riwayat Log
+                </h3>
+                <button onclick="closeManageLogsModal()" class="text-gray-400 hover:text-white text-xl font-bold">&times;</button>
+            </div>
+            <p class="text-xs text-gray-300 mb-4 leading-relaxed">
+                Pilih opsi di bawah untuk membersihkan rekaman insiden yang sudah usang atau mengosongkan riwayat secara manual:
+            </p>
+            <div class="space-y-3">
+                <button onclick="pruneLogs(30)" class="w-full py-2.5 px-4 bg-gray-750 hover:bg-gray-700 text-gray-200 rounded-xl text-xs font-semibold flex items-center justify-between border border-gray-600 transition-all">
+                    <span>🗓️ Hapus Log Lebih dari 30 Hari</span>
+                    <span class="text-indigo-400 text-xs">Bersihkan</span>
+                </button>
+                <button onclick="pruneLogs(7)" class="w-full py-2.5 px-4 bg-gray-750 hover:bg-gray-700 text-gray-200 rounded-xl text-xs font-semibold flex items-center justify-between border border-gray-600 transition-all">
+                    <span>🗓️ Hapus Log Lebih dari 7 Hari</span>
+                    <span class="text-indigo-400 text-xs">Bersihkan</span>
+                </button>
+                <button onclick="clearAllLogs()" class="w-full py-2.5 px-4 bg-red-950/40 hover:bg-red-900/60 text-red-300 rounded-xl text-xs font-semibold flex items-center justify-between border border-red-800/60 transition-all">
+                    <span>⚠️ Kosongkan Seluruh Riwayat Log</span>
+                    <span class="text-red-400 text-xs">Hapus Total</span>
+                </button>
+            </div>
+            <div class="mt-5 pt-3 border-t border-gray-700 flex justify-end">
+                <button onclick="closeManageLogsModal()" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-xs font-medium">Batal</button>
             </div>
         </div>
     </div>
@@ -918,6 +1027,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
         let currentPage = 1;
         const ITEMS_PER_PAGE = 8;
         let isModalOpen = false;
+        let currentViewingEventId = null;
         let activeTab = 'events';
 
         let chart1Instance = null;
@@ -1256,6 +1366,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
             isModalOpen = true;
             const ev = eventsData[idx];
             if (!ev) return;
+            currentViewingEventId = ev.id || null;
             
             document.getElementById('modalTargetHost').innerText = ev.target_host_display || ev.target_host || 'Local Host / Manager';
             document.getElementById('modalIp').innerText = ev.ip || 'N/A';
@@ -1319,6 +1430,68 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
 
         function closeAddAssetModal() {
             document.getElementById('addAssetModal').classList.add('hidden');
+        }
+
+        function openManageLogsModal() {
+            document.getElementById('manageLogsModal').classList.remove('hidden');
+        }
+
+        function closeManageLogsModal() {
+            document.getElementById('manageLogsModal').classList.add('hidden');
+        }
+
+        function pruneLogs(days) {
+            if (!confirm(`Hapus seluruh log insiden yang lebih lama dari ${days} hari?`)) return;
+            fetch('/api/events/prune', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ days: days })
+            })
+            .then(res => res.json())
+            .then(res => {
+                closeManageLogsModal();
+                alert(`Pembersihan selesai: ${res.removed} log lama dibersihkan. Tersisa ${res.remaining} log.`);
+                fetchEventsFromDB();
+            })
+            .catch(err => alert("Gagal membersihkan log: " + err));
+        }
+
+        function clearAllLogs() {
+            if (!confirm("PERINGATAN: Apakah Anda yakin ingin MENGHAPUS SEMUA riwayat log insiden? Tindakan ini tidak dapat dibatalkan.")) return;
+            fetch('/api/events/clear', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            })
+            .then(res => res.json())
+            .then(res => {
+                closeManageLogsModal();
+                alert("Seluruh riwayat log insiden berhasil dikosongkan.");
+                fetchEventsFromDB();
+            })
+            .catch(err => alert("Gagal mengosongkan log: " + err));
+        }
+
+        function deleteCurrentEvent() {
+            if (!currentViewingEventId) {
+                alert("ID insiden tidak ditemukan.");
+                return;
+            }
+            if (!confirm("Apakah Anda yakin ingin menghapus insiden ini dari riwayat log?")) return;
+            fetch('/api/events/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: currentViewingEventId })
+            })
+            .then(res => res.json())
+            .then(res => {
+                if (res.success) {
+                    closeModal();
+                    fetchEventsFromDB();
+                } else {
+                    alert("Gagal menghapus insiden: " + (res.error || 'Terjadi kesalahan'));
+                }
+            })
+            .catch(err => alert("Gagal koneksi ke server: " + err));
         }
 
         function submitNewAsset(e) {
@@ -1488,7 +1661,76 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
                 return
 
-        # D. Webhook Ingestion (Terbuka untuk integrasi Wazuh SIEM)
+        # D. Endpoint Pengelolaan & Pembersihan Log (Memerlukan Autentikasi)
+        elif self.path == '/api/events/clear':
+            if not is_authenticated(self.headers):
+                self.send_response(401)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Unauthorized"}).encode('utf-8'))
+                return
+            save_events([])
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True, "message": "Seluruh riwayat log insiden berhasil dikosongkan."}).encode('utf-8'))
+            return
+
+        elif self.path == '/api/events/prune':
+            if not is_authenticated(self.headers):
+                self.send_response(401)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Unauthorized"}).encode('utf-8'))
+                return
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            days = 30
+            try:
+                req_data = json.loads(post_data)
+                days = int(req_data.get('days', 30))
+            except Exception:
+                pass
+            events = load_events()
+            before_count = len(events)
+            events = prune_events(events, retention_days=days, max_events=SOAR_MAX_EVENTS)
+            save_events(events)
+            removed = before_count - len(events)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True, "removed": removed, "remaining": len(events)}).encode('utf-8'))
+            return
+
+        elif self.path == '/api/events/delete':
+            if not is_authenticated(self.headers):
+                self.send_response(401)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Unauthorized"}).encode('utf-8'))
+                return
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            try:
+                req_data = json.loads(post_data)
+                target_id = str(req_data.get('id', '')).strip()
+                events = load_events()
+                before_count = len(events)
+                new_events = [e for e in events if str(e.get('id', '')) != target_id]
+                save_events(new_events)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "removed": before_count - len(new_events), "remaining": len(new_events)}).encode('utf-8'))
+                return
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+                return
+
+        # E. Webhook Ingestion (Terbuka untuk integrasi Wazuh SIEM)
         elif self.path == '/webhook':
             content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length).decode('utf-8')
@@ -1517,12 +1759,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     action = "block"
                     mitigation_status = "Diblokir oleh ArusBalik Embedded WAF (HTTP 403)"
                     is_valid_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip))
-                    is_whitelisted = (
-                        attacker_ip in ('0.0.0.0', '255.255.255.255') or
-                        attacker_ip.startswith("10.88.0.") or 
-                        attacker_ip.startswith("127.") or 
-                        attacker_ip in EXTRA_WHITELIST_IPS
-                    )
+                    is_whitelisted = is_whitelisted_ip(attacker_ip)
 
                     if attacker_ip and is_valid_ip and not is_whitelisted:
                         should_ban, count, threshold = record_and_check_waf_threshold(attacker_ip, rule_id, threshold=3, window_sec=300)
@@ -1537,7 +1774,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     events = load_events()
                     new_event = {
                         "id": event_id,
-                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "timestamp": extract_log_timestamp(log_data, raw_log),
                         "incident_type": incident_type,
                         "target_host": target_host,
                         "target_host_display": target_display,
@@ -1552,8 +1789,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                         "mitigation": mitigation_status
                     }
                     events.append(new_event)
-                    if len(events) > 50:
-                        events = events[-50:]
+                    events = prune_events(events)
                     save_events(events)
 
                     t = threading.Thread(
@@ -1586,9 +1822,11 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                         block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL)
                         mitigation_status = f"IP {attacker_ip} Diblokir via O(1) ipset (Edge ArusBalik & Proxmox Host)"
                     
+                    event_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
                     events = load_events()
                     new_event = {
-                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "id": event_id,
+                        "timestamp": extract_log_timestamp(log_data, raw_log),
                         "incident_type": incident_type,
                         "target_host": target_host,
                         "target_host_display": target_display,
@@ -1603,8 +1841,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                         "mitigation": mitigation_status
                     }
                     events.append(new_event)
-                    if len(events) > 50:
-                        events = events[-50:]
+                    events = prune_events(events)
                     save_events(events)
                     self.wfile.write(json.dumps({"success": True, "event": new_event}).encode('utf-8'))
                     return
@@ -1636,18 +1873,16 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 action = "ignore"
                 mitigation_status = "Diabaikan (Normal)"
                 is_valid_ip = re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', attacker_ip)
-                
-                is_whitelisted = (
-                    attacker_ip in ('0.0.0.0', '255.255.255.255') or
-                    attacker_ip.startswith("10.88.0.") or 
-                    attacker_ip.startswith("127.") or 
-                    attacker_ip in EXTRA_WHITELIST_IPS
-                )
+                is_lab_environment = any(str(agent_name).lower().startswith(prefix) for prefix in ("lab-", "vm111", "vm112", "vm113", "vm114"))
+                is_whitelisted = is_whitelisted_ip(attacker_ip) or is_lab_environment
 
-                if attacker_ip and is_valid_ip:
+                if is_lab_environment:
+                    action = "ignore"
+                    mitigation_status = "Diabaikan (Lingkungan Lab Riset - Pengecualian SOAR)"
+                elif attacker_ip and is_valid_ip:
                     if is_whitelisted:
                         action = "ignore"
-                        mitigation_status = f"IP {attacker_ip} Dikecualikan (Internal Whitelist)"
+                        mitigation_status = f"IP {attacker_ip} Dikecualikan (Internal/Lab Whitelist)"
                     else:
                         action = "block"
                         block_ip_everywhere(attacker_ip, ttl=DEFAULT_TTL)
@@ -1657,7 +1892,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                 events = load_events()
                 new_event = {
                     "id": event_id,
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": extract_log_timestamp(log_data, raw_log),
                     "incident_type": log_title,
                     "target_host": agent_name,
                     "target_host_display": target_display,
@@ -1672,8 +1907,7 @@ class LightweightSOARHandler(http.server.BaseHTTPRequestHandler):
                     "mitigation": mitigation_status
                 }
                 events.append(new_event)
-                if len(events) > 50:
-                    events = events[-50:]
+                events = prune_events(events)
                 save_events(events)
 
                 t = threading.Thread(target=run_background_analysis, args=(event_id, log_title, log_text, agent_name, raw_log))
